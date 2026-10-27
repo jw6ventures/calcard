@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/lib/pq"
 )
 
 type sessionRepoMock struct {
@@ -124,9 +127,9 @@ func TestSessionManagerCurrentUserIDReadsSessionAndTouchesLastSeen(t *testing.T)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session-55"})
 
-	userID, sessionID, ok := manager.CurrentUserID(context.Background(), req)
-	if !ok || userID != 55 || sessionID != "session-55" {
-		t.Fatalf("CurrentUserID() = (%d, %q, %v)", userID, sessionID, ok)
+	userID, sessionID, ok, err := manager.CurrentUserID(context.Background(), req)
+	if err != nil || !ok || userID != 55 || sessionID != "session-55" {
+		t.Fatalf("CurrentUserID() = (%d, %q, %v, %v)", userID, sessionID, ok, err)
 	}
 
 	select {
@@ -136,6 +139,39 @@ func TestSessionManagerCurrentUserIDReadsSessionAndTouchesLastSeen(t *testing.T)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("TouchLastSeen() was not called")
+	}
+}
+
+func TestSessionManagerCurrentUserIDReturnsAFailedLookupRatherThanNoSession(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	cases := []struct {
+		name    string
+		err     error
+		wantErr bool
+	}{
+		{name: "connection refused", err: refused, wantErr: true},
+		{name: "too many clients", err: &pq.Error{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}, wantErr: true},
+		{name: "statement failure", err: errors.New(`pq: relation "sessions" does not exist`), wantErr: true},
+		{name: "cookie PostgreSQL refuses", err: &pq.Error{Code: "22021", Message: "invalid byte sequence for encoding \"UTF8\""}, wantErr: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewSessionManager(&config.Config{BaseURL: "https://calcard.example"}, &store.Store{
+				Sessions: &sessionRepoMock{
+					getByIDFn: func(context.Context, string) (*store.Session, error) { return nil, tc.err },
+				},
+			})
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session-55"})
+
+			userID, sessionID, ok, err := manager.CurrentUserID(context.Background(), req)
+			if ok || userID != 0 || sessionID != "" {
+				t.Fatalf("CurrentUserID() = (%d, %q, %v), want no session", userID, sessionID, ok)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("CurrentUserID() error = %v, want error %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 

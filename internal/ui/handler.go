@@ -71,17 +71,17 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	calendars, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendars")
 		return
 	}
 	books, err := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address books")
 		return
 	}
 	passwords, err := h.store.AppPasswords.ListByUser(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load app passwords", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load app passwords")
 		return
 	}
 
@@ -118,7 +118,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	for {
 		recentEvents, err := h.store.Events.ListRecentByUser(r.Context(), user.ID, fetchLimit)
 		if err != nil {
-			http.Error(w, "failed to load recent events", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load recent events")
 			return
 		}
 
@@ -126,7 +126,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		for _, ev := range recentEvents {
 			cal, ok, err := resolveCalendarAccess(ev.CalendarID)
 			if err != nil {
-				http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load calendar")
 				return
 			}
 			if !ok {
@@ -134,7 +134,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 			}
 			allowed, err := h.canReadCalendarEvent(r.Context(), user, &cal, ev)
 			if err != nil {
-				http.Error(w, "failed to evaluate recent event access", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to evaluate recent event access")
 				return
 			}
 			if allowed {
@@ -174,7 +174,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	// Fetch recent contacts using the optimized query
 	recentContacts, err := h.store.Contacts.ListRecentByUser(r.Context(), user.ID, 5)
 	if err != nil {
-		http.Error(w, "failed to load recent contacts", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load recent contacts")
 		return
 	}
 
@@ -236,7 +236,7 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 
 	contacts, truncated, err := h.listBoundedBirthdayContacts(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load contacts", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load contacts")
 		return
 	}
 

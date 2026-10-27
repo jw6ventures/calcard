@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -35,11 +36,15 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 type userRepoMock struct {
-	getByIDFn    func(context.Context, int64) (*store.User, error)
-	getByEmailFn func(context.Context, string) (*store.User, error)
+	getByIDFn         func(context.Context, int64) (*store.User, error)
+	getByEmailFn      func(context.Context, string) (*store.User, error)
+	upsertOAuthUserFn func(context.Context, string, string) (*store.User, error)
 }
 
-func (m *userRepoMock) UpsertOAuthUser(context.Context, string, string, string, string) (*store.User, error) {
+func (m *userRepoMock) UpsertOAuthUser(ctx context.Context, subject, email, _, _ string) (*store.User, error) {
+	if m.upsertOAuthUserFn != nil {
+		return m.upsertOAuthUserFn(ctx, subject, email)
+	}
 	return nil, nil
 }
 func (m *userRepoMock) GetByID(ctx context.Context, id int64) (*store.User, error) {
@@ -55,6 +60,7 @@ type appPasswordRepoMock struct {
 	createFn                   func(context.Context, store.AppPassword) (*store.AppPassword, error)
 	findValidByUserFn          func(context.Context, int64) ([]store.AppPassword, error)
 	touchLastUsedFn            func(context.Context, int64) error
+	stillValidFn               func(ctx context.Context, id, userID int64, email, tokenHash string) (bool, error)
 	replaceDigestCredentialsFn func(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error)
 }
 
@@ -72,6 +78,24 @@ func (m *appPasswordRepoMock) Create(ctx context.Context, token store.AppPasswor
 }
 func (m *appPasswordRepoMock) FindValidByUser(ctx context.Context, userID int64) ([]store.AppPassword, error) {
 	return m.findValidByUserFn(ctx, userID)
+}
+
+// StillValid answers from stillValidFn, or else from the rows findValidByUserFn
+// returns, which is what the SQL predicate selects.
+func (m *appPasswordRepoMock) StillValid(ctx context.Context, id, userID int64, email, tokenHash string) (bool, error) {
+	if m.stillValidFn != nil {
+		return m.stillValidFn(ctx, id, userID, email, tokenHash)
+	}
+	tokens, err := m.findValidByUserFn(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, token := range tokens {
+		if token.ID == id && token.TokenHash == tokenHash && token.RevokedAt == nil && (token.ExpiresAt == nil || token.ExpiresAt.After(time.Now())) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (m *appPasswordRepoMock) ListByUser(context.Context, int64) ([]store.AppPassword, error) {
 	return nil, nil
@@ -283,6 +307,139 @@ func TestHandleOAuthCallbackReturnsBadRequestOnExchangeFailure(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "failed to exchange oauth code") {
 		t.Fatalf("response = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// storeFailures are the ways a store read fails when the fault is the
+// server's: the database refusing the connection, refusing a new client, or
+// failing the statement itself.
+func storeFailures() []struct {
+	name       string
+	err        error
+	wantStatus int
+} {
+	return []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "connection refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}, wantStatus: http.StatusServiceUnavailable},
+		{name: "too many clients", err: &pq.Error{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}, wantStatus: http.StatusServiceUnavailable},
+		{name: "statement failure", err: errors.New(`pq: relation "users" does not exist`), wantStatus: http.StatusInternalServerError},
+	}
+}
+
+// assertStoreFailureAnswer checks a request the store failed was answered as
+// the server's failure: the status, Retry-After exactly on a 503, and a body
+// carrying none of the store's error.
+func assertStoreFailureAnswer(t *testing.T, rec *httptest.ResponseRecorder, cause error, wantStatus int) {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, wantStatus, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After") != ""; got != (wantStatus == http.StatusServiceUnavailable) {
+		t.Fatalf("Retry-After present = %v for status %d", got, rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), cause.Error()) || strings.Contains(rec.Body.String(), "pq:") {
+		t.Fatalf("body %q exposes the store error", rec.Body.String())
+	}
+	if wantStatus == http.StatusServiceUnavailable && strings.TrimSpace(rec.Body.String()) != http.StatusText(wantStatus) {
+		t.Fatalf("body = %q, want the status text alone", rec.Body.String())
+	}
+}
+
+// A session the store could not read is not a logged-out session. Sending the
+// visitor to log in, or clearing the cookie, over a database outage logs out
+// every user of the instance at once.
+func TestRequireSessionAnswersAFailedLookupWithoutLoggingOut(t *testing.T) {
+	for _, failure := range storeFailures() {
+		for _, stage := range []string{"session", "user"} {
+			t.Run(stage+" lookup "+failure.name, func(t *testing.T) {
+				sessionErr, userErr := failure.err, error(nil)
+				if stage == "user" {
+					sessionErr, userErr = nil, failure.err
+				}
+				service := &Service{
+					store: &store.Store{Users: &userRepoMock{getByIDFn: func(_ context.Context, id int64) (*store.User, error) {
+						if userErr != nil {
+							return nil, userErr
+						}
+						return &store.User{ID: id}, nil
+					}}},
+					sessions: &SessionManager{store: &store.Store{Sessions: &sessionRepoMock{
+						getByIDFn: func(_ context.Context, id string) (*store.Session, error) {
+							if sessionErr != nil {
+								return nil, sessionErr
+							}
+							return &store.Session{ID: id, UserID: 12}, nil
+						},
+						deleteFn: func(context.Context, string) error {
+							t.Fatal("a session that could not be read was deleted")
+							return nil
+						},
+					}}},
+				}
+				protected := service.RequireSession(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("a request whose session was never read reached the handler")
+				}))
+				req := httptest.NewRequest(http.MethodGet, "/calendars", nil)
+				req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "good-session"})
+				rec := httptest.NewRecorder()
+
+				protected.ServeHTTP(rec, req)
+
+				assertStoreFailureAnswer(t, rec, failure.err, failure.wantStatus)
+				if location := rec.Header().Get("Location"); location != "" {
+					t.Fatalf("Location = %q, want no redirect", location)
+				}
+				if cookies := rec.Result().Cookies(); len(cookies) != 0 {
+					t.Fatalf("cookies = %#v, want the session cookie left alone", cookies)
+				}
+			})
+		}
+	}
+}
+
+// The identity provider has vouched for the user by the time the callback
+// persists them, so a store that cannot do so fails the login on the
+// server's side, and an outage is one the browser can retry.
+func TestHandleOAuthCallbackAnswersAStoreFailureAsTheServers(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/token":
+			_, _ = io.WriteString(w, `{"access_token":"access","token_type":"Bearer","expires_in":300}`)
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"sub":"subject-1","email":"user@example.com","name":"User"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+	oidcProvider := (&oidc.ProviderConfig{
+		IssuerURL:   provider.URL,
+		AuthURL:     provider.URL + "/authorize",
+		TokenURL:    provider.URL + "/token",
+		UserInfoURL: provider.URL + "/userinfo",
+	}).NewProvider(context.Background())
+
+	for _, failure := range storeFailures() {
+		t.Run(failure.name, func(t *testing.T) {
+			service := &Service{
+				provider: oidcProvider,
+				oauthCfg: &oauth2.Config{ClientID: "client-id", ClientSecret: "secret", Endpoint: oidcProvider.Endpoint()},
+				store: &store.Store{Users: &userRepoMock{upsertOAuthUserFn: func(context.Context, string, string) (*store.User, error) {
+					return nil, failure.err
+				}}},
+			}
+			req := httptest.NewRequest(http.MethodGet, "/auth/callback?state=expected&code=abc", nil)
+			req.AddCookie(&http.Cookie{Name: "calcard_oauth_state", Value: "expected"})
+			rec := httptest.NewRecorder()
+
+			service.HandleOAuthCallback(rec, req)
+
+			assertStoreFailureAnswer(t, rec, failure.err, failure.wantStatus)
+		})
 	}
 }
 
@@ -1076,6 +1233,7 @@ func TestRequireDAVAuthAnswersCredentialLookupFailuresWithoutAChallenge(t *testi
 		scheme         string
 		userErr        error
 		tokensErr      error
+		nonceErr       error
 		noUser         bool
 		noTokens       bool
 		wantStatus     int
@@ -1091,6 +1249,8 @@ func TestRequireDAVAuthAnswersCredentialLookupFailuresWithoutAChallenge(t *testi
 		{name: "digest user lookup too many clients", scheme: "Digest", userErr: tooManyClients, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
 		{name: "digest token lookup refused", scheme: "Digest", tokensErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
 		{name: "digest token lookup query failure", scheme: "Digest", tokensErr: queryFailure, wantStatus: http.StatusInternalServerError},
+		{name: "digest nonce claim refused", scheme: "Digest", nonceErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "digest nonce claim too many clients", scheme: "Digest", nonceErr: tooManyClients, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
 		{name: "digest username the database cannot encode", scheme: "Digest", userErr: invalidEncoding, wantStatus: http.StatusUnauthorized, wantChallenge: true},
 		{name: "basic unknown user", scheme: "Basic", noUser: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
 		{name: "basic user without a valid app password", scheme: "Basic", noTokens: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
@@ -1121,6 +1281,9 @@ func TestRequireDAVAuthAnswersCredentialLookupFailuresWithoutAChallenge(t *testi
 					return []store.AppPassword{{ID: 3, TokenHash: string(hash), DigestSHA256HA1: sha256HA1}}, nil
 				}},
 				DigestNonces: &digestNonceRepoMock{consumeFn: func(context.Context, int64, string, uint32, time.Time) (bool, error) {
+					if tc.nonceErr != nil {
+						return false, tc.nonceErr
+					}
 					return true, nil
 				}},
 			}
@@ -1149,7 +1312,7 @@ func TestRequireDAVAuthAnswersCredentialLookupFailuresWithoutAChallenge(t *testi
 			if got := rec.Header().Get("Retry-After") != ""; got != tc.wantRetryAfter {
 				t.Fatalf("Retry-After present = %v, want %v", got, tc.wantRetryAfter)
 			}
-			for _, cause := range []error{tc.userErr, tc.tokensErr} {
+			for _, cause := range []error{tc.userErr, tc.tokensErr, tc.nonceErr} {
 				if cause != nil && strings.Contains(rec.Body.String(), cause.Error()) {
 					t.Fatalf("body %q exposes the store error", rec.Body.String())
 				}
@@ -1162,8 +1325,8 @@ func TestAuthCacheClearUserRemovesOnlyThatUsersCredentials(t *testing.T) {
 	service := &Service{}
 	firstKey := authCacheKey("first@example.com", "first-secret")
 	secondKey := authCacheKey("second@example.com", "second-secret")
-	service.authCachePut(firstKey, &store.User{ID: 1}, 10, nil)
-	service.authCachePut(secondKey, &store.User{ID: 2}, 20, nil)
+	service.authCachePut(firstKey, &store.User{ID: 1}, store.AppPassword{ID: 10})
+	service.authCachePut(secondKey, &store.User{ID: 2}, store.AppPassword{ID: 20})
 
 	service.authCacheClearUser(1)
 
@@ -1175,9 +1338,8 @@ func TestAuthCacheClearUserRemovesOnlyThatUsersCredentials(t *testing.T) {
 	}
 }
 
-// A cache hit skips the database entirely, so its lifetime is the window in
-// which a credential keeps working after it should have stopped. An entry may
-// therefore never outlive the password it stands for.
+// An entry may never outlive the password it stands for, independently of the
+// row check each cache hit makes.
 func TestAuthCacheEntryNeverOutlivesThePasswordExpiry(t *testing.T) {
 	const (
 		username = "user@example.com"
@@ -1250,17 +1412,16 @@ func TestExpiredAppPasswordIsRejectedEvenAfterACacheHit(t *testing.T) {
 	}
 }
 
-// Revocation is immediate on the instance that performed it. Leaving the cached
-// entry behind would keep the credential working there for the rest of the TTL,
-// which is exactly the window an administrator revoking a password is trying to
-// close.
+// Revoking drops the entry on the instance that performed it, so the next
+// request there goes to full validation without a wasted row check, and other
+// app passwords' entries are left alone.
 func TestRevokingAnAppPasswordClearsItsCachedCredential(t *testing.T) {
 	service := &Service{}
 	revokedKey := authCacheKey("user@example.com", "revoked-secret")
 	keptKey := authCacheKey("user@example.com", "kept-secret")
 	user := &store.User{ID: 1}
-	service.authCachePut(revokedKey, user, 10, nil)
-	service.authCachePut(keptKey, user, 11, nil)
+	service.authCachePut(revokedKey, user, store.AppPassword{ID: 10})
+	service.authCachePut(keptKey, user, store.AppPassword{ID: 11})
 
 	service.InvalidateAppPassword(10)
 
@@ -2221,5 +2382,232 @@ func TestDigestHA1AEADIsDerivedOncePerSecret(t *testing.T) {
 	}
 	if _, err := decryptDigestHA1(rotated, "MD5", sealed); err == nil {
 		t.Fatal("a value sealed under one secret opened under another")
+	}
+}
+
+// replicaCredentialStore is the users and app_passwords tables as two server
+// processes see them: one shared state behind the repository calls, so a write
+// made through one Service is what the other reads next.
+type replicaCredentialStore struct {
+	mu              sync.Mutex
+	user            store.User
+	tokens          []store.AppPassword
+	findValidCalls  int
+	stillValidCalls int
+}
+
+func (r *replicaCredentialStore) store() *store.Store {
+	return &store.Store{
+		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if email != r.user.PrimaryEmail {
+				return nil, nil
+			}
+			user := r.user
+			return &user, nil
+		}},
+		AppPasswords: &appPasswordRepoMock{
+			findValidByUserFn: func(_ context.Context, userID int64) ([]store.AppPassword, error) {
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				r.findValidCalls++
+				var valid []store.AppPassword
+				for _, token := range r.tokens {
+					if token.UserID == userID && r.validLocked(token) {
+						valid = append(valid, token)
+					}
+				}
+				return valid, nil
+			},
+			stillValidFn: func(_ context.Context, id, userID int64, email, tokenHash string) (bool, error) {
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				r.stillValidCalls++
+				if r.user.ID != userID || r.user.PrimaryEmail != email {
+					return false, nil
+				}
+				for _, token := range r.tokens {
+					if token.ID == id && token.UserID == userID && token.TokenHash == tokenHash {
+						return r.validLocked(token), nil
+					}
+				}
+				return false, nil
+			},
+		},
+	}
+}
+
+func (r *replicaCredentialStore) validLocked(token store.AppPassword) bool {
+	return token.RevokedAt == nil && (token.ExpiresAt == nil || token.ExpiresAt.After(time.Now()))
+}
+
+func (r *replicaCredentialStore) update(fn func(*replicaCredentialStore)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fn(r)
+}
+
+func (r *replicaCredentialStore) counts() (findValid, stillValid int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.findValidCalls, r.stillValidCalls
+}
+
+func newReplicaCredentialStore(t *testing.T, email, password string) *replicaCredentialStore {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	now := time.Now()
+	return &replicaCredentialStore{
+		user:   store.User{ID: 7, PrimaryEmail: email},
+		tokens: []store.AppPassword{{ID: 3, UserID: 7, TokenHash: string(hash), LastUsedAt: &now}},
+	}
+}
+
+// Every replica holds its own credential cache and only the one that served a
+// revocation can clear its entry, so each cache hit has to consult the shared
+// row for the credential to stop working everywhere at once.
+func TestAppPasswordChangesReachEveryReplicaOnTheNextRequest(t *testing.T) {
+	const (
+		email    = "user@example.com"
+		password = "app-secret"
+	)
+	for _, tc := range []struct {
+		name     string
+		username string
+		change   func(*replicaCredentialStore)
+	}{
+		{
+			name:     "revoked",
+			username: email,
+			change: func(r *replicaCredentialStore) {
+				r.tokens[0].RevokedAt = ptrTime(time.Now())
+			},
+		},
+		{
+			name:     "expired",
+			username: email,
+			change: func(r *replicaCredentialStore) {
+				r.tokens[0].ExpiresAt = ptrTime(time.Now().Add(-time.Second))
+			},
+		},
+		{
+			// UpsertOAuthUser's email change: the address moves and every app
+			// password is revoked in the same statement.
+			name:     "email changed and passwords revoked",
+			username: email,
+			change: func(r *replicaCredentialStore) {
+				r.user.PrimaryEmail = "renamed@example.com"
+				r.tokens[0].RevokedAt = ptrTime(time.Now())
+			},
+		},
+		{
+			// The Basic username is the email, so a cached entry for the old
+			// address must not survive the address moving even if the row
+			// itself were left unrevoked.
+			name:     "email changed alone",
+			username: email,
+			change: func(r *replicaCredentialStore) {
+				r.user.PrimaryEmail = "renamed@example.com"
+			},
+		},
+		{
+			name:     "password row replaced",
+			username: email,
+			change: func(r *replicaCredentialStore) {
+				r.tokens[0].TokenHash = "$2a$04$replacedreplacedreplacedreplacedreplacedreplacedrepla"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shared := newReplicaCredentialStore(t, email, password)
+			replicaA := &Service{cfg: testAuthConfig("https://calcard.example"), store: shared.store()}
+			replicaB := &Service{cfg: testAuthConfig("https://calcard.example"), store: shared.store()}
+
+			for _, replica := range []*Service{replicaA, replicaB} {
+				if _, err := replica.ValidateAppPassword(context.Background(), tc.username, password); err != nil {
+					t.Fatalf("ValidateAppPassword() before the change error = %v", err)
+				}
+			}
+
+			// Replica B serves the change and clears its own cache; replica A
+			// is never told.
+			shared.update(tc.change)
+			replicaB.InvalidateAppPassword(3)
+
+			if _, err := replicaA.ValidateAppPassword(context.Background(), tc.username, password); err == nil {
+				t.Fatal("replica A still accepted the credential from its cache")
+			}
+			if _, err := replicaB.ValidateAppPassword(context.Background(), tc.username, password); err == nil {
+				t.Fatal("replica B accepted the credential")
+			}
+		})
+	}
+}
+
+// The cache exists to keep bcrypt off the per-request path; revalidating the
+// row must not bring it back.
+func TestAppPasswordCacheHitRevalidatesTheRowWithoutBcrypt(t *testing.T) {
+	const (
+		email    = "user@example.com"
+		password = "app-secret"
+	)
+	shared := newReplicaCredentialStore(t, email, password)
+	service := &Service{cfg: testAuthConfig("https://calcard.example"), store: shared.store()}
+
+	for i := 0; i < 3; i++ {
+		user, err := service.ValidateAppPassword(context.Background(), email, password)
+		if err != nil {
+			t.Fatalf("ValidateAppPassword() call %d error = %v", i, err)
+		}
+		if user.ID != 7 {
+			t.Fatalf("ValidateAppPassword() call %d user = %#v", i, user)
+		}
+	}
+
+	findValid, stillValid := shared.counts()
+	if findValid != 1 {
+		t.Fatalf("FindValidByUser ran %d times, want once for the first request only", findValid)
+	}
+	if stillValid != 2 {
+		t.Fatalf("StillValid ran %d times, want once per cache hit (2)", stillValid)
+	}
+}
+
+// A store outage while revalidating is not proof the credential is bad; it is
+// reported as the lookup failure it is, and the cached entry is kept for when
+// the database answers again.
+func TestAppPasswordCacheHitReportsAStoreFailureAsALookupError(t *testing.T) {
+	const (
+		email    = "user@example.com"
+		password = "app-secret"
+	)
+	shared := newReplicaCredentialStore(t, email, password)
+	st := shared.store()
+	service := &Service{cfg: testAuthConfig("https://calcard.example"), store: st}
+	if _, err := service.ValidateAppPassword(context.Background(), email, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+
+	outage := errors.New("connection refused")
+	repo := st.AppPasswords.(*appPasswordRepoMock)
+	healthy := repo.stillValidFn
+	repo.stillValidFn = func(context.Context, int64, int64, string, string) (bool, error) {
+		return false, outage
+	}
+	_, err := service.ValidateAppPassword(context.Background(), email, password)
+	if !errors.Is(err, outage) || !errors.Is(err, errCredentialLookup) {
+		t.Fatalf("ValidateAppPassword() during outage error = %v, want a credential lookup error wrapping the outage", err)
+	}
+
+	repo.stillValidFn = healthy
+	if _, err := service.ValidateAppPassword(context.Background(), email, password); err != nil {
+		t.Fatalf("ValidateAppPassword() after outage error = %v", err)
+	}
+	if findValid, _ := shared.counts(); findValid != 1 {
+		t.Fatalf("FindValidByUser ran %d times, want the entry kept across the outage", findValid)
 	}
 }

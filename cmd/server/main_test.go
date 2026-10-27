@@ -141,6 +141,59 @@ func assertSameOffsets(t *testing.T, alias string, aliasLoc *time.Location, zone
 	}
 }
 
+// Each replica opens its own database pool and keeps its own rate-limit
+// buckets, so the startup line has to say so: a fleet's real connection count
+// and admitted rate are these numbers times the replica count.
+func TestPerReplicaLimitsStartupLine(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  func(*config.Config)
+		want []string
+	}{
+		{
+			name: "bounded pool",
+			cfg: func(c *config.Config) {
+				c.DB.MaxOpenConns = 25
+				c.DB.MaxIdleConns = 10
+				c.DB.ConnMaxLifetime = 30 * time.Minute
+			},
+			want: []string{"per replica", "max open 25", "max idle 10", "conn max lifetime 30m0s",
+				"auth 5 req/s burst 10", "DAV and API 20 req/s burst 100", "per client IP"},
+		},
+		{
+			name: "unlimited pool",
+			cfg:  func(c *config.Config) { c.DB.MaxOpenConns = 0 },
+			want: []string{"max open unlimited"},
+		},
+		{
+			name: "limiter off",
+			cfg:  func(c *config.Config) { c.RateLimit.AuthRPS = 0 },
+			want: []string{"auth off", "DAV and API 20 req/s burst 100"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.RateLimit.AuthRPS = 5
+			cfg.RateLimit.AuthBurst = 10
+			cfg.RateLimit.DAVRPS = 20
+			cfg.RateLimit.DAVBurst = 100
+			tt.cfg(cfg)
+
+			logger := &recordingLogger{}
+			logPerReplicaLimits(logger, cfg)
+			if len(logger.entries) != 1 || logger.entries[0].level != jw6_utils.Info {
+				t.Fatalf("logged %#v, want one Info line", logger.entries)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(logger.entries[0].message, want) {
+					t.Errorf("startup line %q does not mention %q", logger.entries[0].message, want)
+				}
+			}
+		})
+	}
+}
+
 // Accepting Basic over plain HTTP sends the password and every calendar and
 // contact byte in cleartext, so every start with it enabled says so at Warn,
 // and a start without it says nothing.

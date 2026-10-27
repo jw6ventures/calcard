@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -32,12 +34,12 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 	}
 	aclGuard, err := h.aclGuard(r.Context(), user, sourcePath, destinationPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	destinationSlug, status, err := h.calendarCollectionTransferDestination(r, user, destinationPath)
 	if err != nil {
-		http.Error(w, "failed to resolve destination", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve destination")
 		return
 	}
 	if status != 0 {
@@ -52,7 +54,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			return
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "failed to resolve source calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve source calendar")
 			return
 		}
 		http.Error(w, "source calendar not found", http.StatusNotFound)
@@ -90,7 +92,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			http.Error(w, "ambiguous destination calendar", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to resolve destination calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve destination calendar")
 		return
 	}
 	if destination != nil && destination.ID == source.ID {
@@ -111,9 +113,9 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			return
 		}
 	}
-	members, failures, err := h.preflightCalendarCollectionMembers(r, user, source, depth, operation)
+	members, failures, preflight, err := h.preflightCalendarCollectionMembers(r, user, source, depth, operation)
 	if err != nil {
-		http.Error(w, "failed to load source calendar members", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load source calendar members")
 		return
 	}
 	if len(failures) != 0 {
@@ -125,7 +127,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 	if destination != nil {
 		destinationMembers, err := h.store.Events.ListForCalendar(r.Context(), destination.ID)
 		if err != nil {
-			http.Error(w, "failed to load destination calendar members", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load destination calendar members")
 			return
 		}
 		for i := range destinationMembers {
@@ -166,7 +168,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 	} else {
 		destinationLockPath, err = h.canonicalDAVPath(r.Context(), user, destinationPath)
 		if err != nil {
-			http.Error(w, "failed to resolve destination lock path", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve destination lock path")
 			return
 		}
 	}
@@ -185,9 +187,15 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 		Members:              members,
 		LockPreconditions:    lockPreconditions,
 		ExpectedACL:          aclGuard,
+		RevalidateMembers:    preflight.revalidate,
 	}
 	defer invalidateDAVRequestState(r.Context())
 	result, err := h.store.TransferCalendarCollection(r.Context(), transfer)
+	var memberFailures calendarCollectionMemberFailures
+	if errors.As(err, &memberFailures) {
+		writeCalendarCollectionMemberFailures(w, memberFailures)
+		return
+	}
 	if errors.Is(err, store.ErrResourceStateChanged) && retries > 0 {
 		// The collection, its members or the ACL the request was authorized
 		// against changed; the next attempt re-reads all of them.
@@ -207,7 +215,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			http.Error(w, "source calendar not found", http.StatusNotFound)
 		default:
 			h.logger().Error("CalendarCollectionTransfer", "%s calendar %d failed: %v", operation, source.ID, err)
-			http.Error(w, "failed to transfer calendar collection", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to transfer calendar collection")
 		}
 		return
 	}
@@ -261,34 +269,93 @@ type calendarCollectionMemberFailure struct {
 	fault *calendarObjectFault
 }
 
-func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *store.User, source *store.CalendarAccess, depth string, operation store.CalendarCollectionTransferOperation) ([]store.CalendarCollectionMember, []calendarCollectionMemberFailure, error) {
+// calendarCollectionMemberFailures is the error a revalidation that finds
+// members the destination cannot store fails the transfer with.
+type calendarCollectionMemberFailures []calendarCollectionMemberFailure
+
+func (f calendarCollectionMemberFailures) Error() string {
+	return fmt.Sprintf("%d calendar collection members cannot be transferred", len(f))
+}
+
+// calendarCollectionPreflight checks source's members for a transfer of them
+// as preflightCalendarCollectionMembers checked the ones it read.
+type calendarCollectionPreflight struct {
+	user      *store.User
+	source    *store.CalendarAccess
+	operation store.CalendarCollectionTransferOperation
+	// collectionACL is the source's own ACL as the preflight read it, which
+	// the transfer's ACL guard holds in place.
+	collectionACL []store.ACLEntry
+}
+
+func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *store.User, source *store.CalendarAccess, depth string, operation store.CalendarCollectionTransferOperation) ([]store.CalendarCollectionMember, []calendarCollectionMemberFailure, *calendarCollectionPreflight, error) {
+	preflight := &calendarCollectionPreflight{user: user, source: source, operation: operation}
 	if depth == "0" && operation == store.CalendarCollectionCopy {
-		return nil, nil, nil
+		return nil, nil, preflight, nil
 	}
 	events, err := h.store.Events.ListForCalendar(r.Context(), source.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	// One pool serves every member of this attempt, so the recurrence and
+	var entries map[string][]store.ACLEntry
+	if operation == store.CalendarCollectionCopy {
+		if entries, err = h.prefetchCalendarACLEntries(r.Context(), user, source.ID, events); err != nil {
+			return nil, nil, nil, err
+		}
+		preflight.collectionACL = entries[calendarCollectionResourcePath(source.ID)]
+	}
+	members, failures, err := preflight.check(r.Context(), events, entries)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return members, failures, preflight, nil
+}
+
+// revalidate is the transfer's RevalidateMembers: it checks the members that
+// changed after the preflight read them, under the transfer's locks, against
+// the ACL entries the transaction read at their paths.
+func (p *calendarCollectionPreflight) revalidate(ctx context.Context, changed []store.Event, memberACL []store.ACLEntry) ([]store.CalendarCollectionMember, error) {
+	var entries map[string][]store.ACLEntry
+	if p.operation == store.CalendarCollectionCopy {
+		entries = map[string][]store.ACLEntry{calendarCollectionResourcePath(p.source.ID): p.collectionACL}
+		for _, entry := range memberACL {
+			entries[entry.ResourcePath] = append(entries[entry.ResourcePath], entry)
+		}
+		for resourcePath := range entries {
+			acl.SortEntries(entries[resourcePath])
+		}
+	}
+	members, failures, err := p.check(ctx, changed, entries)
+	if err != nil {
+		return nil, err
+	}
+	if len(failures) != 0 {
+		return nil, calendarCollectionMemberFailures(failures)
+	}
+	return members, nil
+}
+
+// check validates events as members of the transfer, deciding a COPY's read
+// privilege on each from entries, the ACL stored at the source and at each
+// event's path.
+func (p *calendarCollectionPreflight) check(ctx context.Context, events []store.Event, entries map[string][]store.ACLEntry) ([]store.CalendarCollectionMember, []calendarCollectionMemberFailure, error) {
+	source := p.source
+	// One pool serves every member this check reads, so the recurrence and
 	// observance work of the whole collection is bounded, not each member's
 	// alone.
-	pool := ical.NewRequestWork(r.Context(), transferWorkBudget(len(events)))
+	pool := ical.NewRequestWork(ctx, transferWorkBudget(len(events)))
 	var readDecider *batchedObjectACLDecider
-	if operation == store.CalendarCollectionCopy {
-		entries, err := h.prefetchCalendarACLEntries(r.Context(), user, source.ID, events)
-		if err != nil {
-			return nil, nil, err
-		}
-		readDecider = newBatchedObjectACLDecider(user, source.UserID, calendarCollectionResourcePath(source.ID), entries)
+	if p.operation == store.CalendarCollectionCopy {
+		readDecider = newBatchedObjectACLDecider(p.user, source.UserID, calendarCollectionResourcePath(source.ID), entries)
 	}
 	members := make([]store.CalendarCollectionMember, 0, len(events))
 	var failures []calendarCollectionMemberFailure
 	for i := range events {
-		if err := r.Context().Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 		event := &events[i]
-		if operation == store.CalendarCollectionCopy {
+		if p.operation == store.CalendarCollectionCopy {
 			allowed, denied := calendarPrivilegeDecisionWithDecider(source, eventResourceName(*event), "read", readDecider)
 			if !allowed && !denied {
 				allowed = source.EffectivePrivileges().Allows("read")
@@ -314,7 +381,7 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 		// A COPY is a new resource with an ETag of its own; a MOVE keeps the
 		// member's.
 		newETag := ""
-		if operation == store.CalendarCollectionCopy {
+		if p.operation == store.CalendarCollectionCopy {
 			newETag = newCopyETag(event.RawICAL, source.ID)
 		}
 		members = append(members, store.CalendarCollectionMember{
@@ -349,11 +416,11 @@ func writeCalendarCollectionMemberFailures(w http.ResponseWriter, failures []cal
 }
 
 func writeCalendarCollectionAccessError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
+	status := serverFailureStatus(err)
 	if errors.Is(err, store.ErrNotFound) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, errForbidden) {
 		status = http.StatusForbidden
 	}
-	http.Error(w, http.StatusText(status), status)
+	writeStatusText(w, status)
 }

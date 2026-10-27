@@ -32,12 +32,12 @@ func (h *Handler) AddressBooks(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	books, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
-		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address books")
 		return
 	}
 	users, err := h.store.Users.ListActive(r.Context())
 	if err != nil {
-		http.Error(w, "failed to load users", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load users")
 		return
 	}
 	userMap := make(map[int64]store.User, len(users))
@@ -57,7 +57,7 @@ func (h *Handler) AddressBooks(w http.ResponseWriter, r *http.Request) {
 		if !book.Shared {
 			shares, err := h.addressBookShareViews(r.Context(), user, book.ID, userMap)
 			if err != nil {
-				http.Error(w, "failed to load shares", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load shares")
 				return
 			}
 			bv.Shares = shares
@@ -117,6 +117,9 @@ func (h *Handler) CreateAddressBook(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	_, err := h.store.AddressBooks.Create(r.Context(), store.AddressBook{UserID: user.ID, Name: name})
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "failed to create"})
 		return
 	}
@@ -142,6 +145,9 @@ func (h *Handler) RenameAddressBook(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	book, err := h.store.AddressBooks.GetByID(r.Context(), id)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "rename failed"})
 		return
 	}
@@ -150,6 +156,9 @@ func (h *Handler) RenameAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.contacts.RenameAddressBook(r.Context(), user, id, name); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		message := "rename failed"
 		if errors.Is(err, contacts.ErrLocked) {
 			message = addressBookLockedMessage
@@ -169,6 +178,9 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 	}
 	user, _ := auth.UserFromContext(r.Context())
 	if err := h.contacts.DeleteAddressBook(r.Context(), user, id); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		message := "delete failed"
 		if errors.Is(err, contacts.ErrLocked) {
 			message = addressBookLockedMessage
@@ -198,6 +210,9 @@ func (h *Handler) ShareAddressBook(w http.ResponseWriter, r *http.Request) {
 	}
 	editor := strings.EqualFold(strings.TrimSpace(r.FormValue("role")), "editor")
 	if err := h.contacts.ShareAddressBook(r.Context(), user, bookID, targetID, editor); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
 		return
 	}
@@ -218,6 +233,9 @@ func (h *Handler) UnshareAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.contacts.UnshareAddressBook(r.Context(), user, bookID, targetID); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
 		return
 	}
@@ -234,7 +252,7 @@ func (h *Handler) writeContactAccessError(w http.ResponseWriter, err error) {
 	case http.StatusForbidden:
 		http.Error(w, "forbidden", http.StatusForbidden)
 	default:
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address book")
 	}
 }
 
@@ -272,7 +290,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 	}
 	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
 	if err != nil {
-		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve access")
 		return
 	}
 
@@ -282,7 +300,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.contacts.ListContactsPage(r.Context(), user, *book, limit, offset)
 	if err != nil {
-		http.Error(w, "failed to load contacts", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load contacts")
 		return
 	}
 
@@ -310,7 +328,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 	// Get the address books the user may move contacts into (editor access).
 	accessibleBooks, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
-		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address books")
 		return
 	}
 	allBooks := make([]store.AddressBook, 0, len(accessibleBooks))
@@ -379,6 +397,9 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 	// stored with, so a contact written here and one written by a CardDAV PUT
 	// carry the same identity.
 	if _, _, err := h.contacts.CreateContact(r.Context(), user, bookID, contacts.UpsertInput{Structured: &input}); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID),
 			map[string]string{"error": contactWriteFlashError(r, err, "failed to create contact")})
 		return
@@ -475,18 +496,22 @@ func contactFieldMessage(err *contacts.FieldError) string {
 // storedContactHasEmail reports whether the stored contact's card carries
 // email as one of its EMAIL values, as the page read it: the raw value of the
 // card the page was served, unfolded as the page unfolds it and before any
-// unescaping. A contact that cannot be read carries none.
-func (h *Handler) storedContactHasEmail(ctx context.Context, user *store.User, bookID int64, uid, email string) bool {
+// unescaping. A contact that cannot be read carries none, except that an
+// unavailable store is returned as the error it is.
+func (h *Handler) storedContactHasEmail(ctx context.Context, user *store.User, bookID int64, uid, email string) (bool, error) {
 	contact, err := h.contacts.GetContact(ctx, user, bookID, uid)
+	if store.IsUnavailable(err) {
+		return false, err
+	}
 	if err != nil || contact == nil {
-		return false
+		return false, nil
 	}
 	for _, raw := range vcard.ContentLines(contacts.EditableCard(contact.RawVCard)) {
 		if line, ok := vcard.ParseLine(raw); ok && line.Is("EMAIL") && strings.TrimSpace(line.Value) == email {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // validateContactEmail rejects an address no mail system could route. vCard
@@ -520,7 +545,7 @@ func (h *Handler) requireEditableAddressBook(w http.ResponseWriter, r *http.Requ
 	}
 	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
 	if err != nil {
-		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve access")
 		return nil, false
 	}
 	if !access.Editor {
@@ -568,9 +593,15 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 	// The service does not judge an address's shape, so that check is the
 	// form's own. An address the stored card already carries is sent back
 	// unchanged by the form, and is left to whichever client wrote it.
-	if validateContactEmail(input.Email) != nil && !h.storedContactHasEmail(r.Context(), user, bookID, uid, input.Email) {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "The email address is not valid."})
-		return
+	if validateContactEmail(input.Email) != nil {
+		kept, err := h.storedContactHasEmail(r.Context(), user, bookID, uid, input.Email)
+		if writeStoreUnavailable(w, err) {
+			return
+		}
+		if !kept {
+			h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "The email address is not valid."})
+			return
+		}
 	}
 	// An edit changes the contact, not its identity: the service carries the
 	// stored resource name across the write, which keeps the href the sync
@@ -586,6 +617,9 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		case http.StatusForbidden:
 			http.Error(w, "forbidden", http.StatusForbidden)
 		default:
+			if writeStoreUnavailable(w, err) {
+				return
+			}
 			h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID),
 				map[string]string{"error": contactWriteFlashError(r, err, "failed to update contact")})
 		}
@@ -629,6 +663,9 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, contacts.ErrChangedConcurrently):
 		h.redirect(w, r, page, map[string]string{"error": contactKeptChangingMessage("deleted")})
 	default:
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		httperrors.LogError(r, "failed to delete contact", err)
 		h.redirect(w, r, page, map[string]string{"error": "failed to delete contact"})
 	}
@@ -675,6 +712,9 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 	}
 	sourcePage := fmt.Sprintf("/addressbooks/%d", bookID)
 	if _, err := h.contacts.GetAddressBook(r.Context(), user, targetBookID); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, sourcePage, map[string]string{"error": "target address book not found"})
 		return
 	}
@@ -698,6 +738,9 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, contacts.ErrUnwritableName):
 		h.redirect(w, r, sourcePage, map[string]string{"error": unwritableContactMessage})
 	default:
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		httperrors.LogError(r, "failed to move contact", err)
 		h.redirect(w, r, sourcePage, map[string]string{"error": "failed to move contact"})
 	}
@@ -745,6 +788,9 @@ func (h *Handler) ImportAddressBook(w http.ResponseWriter, r *http.Request) {
 		case http.StatusNotFound, http.StatusForbidden:
 			h.writeContactAccessError(w, err)
 		default:
+			if writeStoreUnavailable(w, err) {
+				return
+			}
 			httperrors.LogError(r, "import contacts", err)
 			h.redirect(w, r, target, map[string]string{"error": "failed to import contacts"})
 		}

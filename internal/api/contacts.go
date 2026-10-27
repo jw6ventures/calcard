@@ -65,7 +65,7 @@ func (h *Handler) ListAddressBooks(w http.ResponseWriter, r *http.Request) {
 	}
 	books, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
-		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address books")
 		return
 	}
 	resp := make([]addressBookResponse, 0, len(books))
@@ -92,7 +92,7 @@ func (h *Handler) GetAddressBook(w http.ResponseWriter, r *http.Request) {
 	}
 	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
 	if err != nil {
-		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve access")
 		return
 	}
 	writeJSON(w, http.StatusOK, toAddressBookAccessResponse(access))
@@ -233,7 +233,11 @@ func (h *Handler) ListAddressBookShares(w http.ResponseWriter, r *http.Request) 
 	resp := make([]addressBookShareResponse, 0, len(shares))
 	for _, s := range shares {
 		email := ""
-		if u, err := h.store.Users.GetByID(r.Context(), s.UserID); err == nil && u != nil {
+		u, err := h.store.Users.GetByID(r.Context(), s.UserID)
+		if writeStoreUnavailable(w, err) {
+			return
+		}
+		if err == nil && u != nil {
 			email = u.PrimaryEmail
 		}
 		resp = append(resp, addressBookShareResponse{UserID: s.UserID, Email: email, Role: shareRole(s.Editor)})
@@ -454,7 +458,7 @@ func toContactResponse(c store.Contact) contactResponse {
 func writeContactError(w http.ResponseWriter, err error) {
 	status := contacts.StatusCode(err)
 	if status == http.StatusInternalServerError {
-		http.Error(w, "internal server error", status)
+		writeServerFailure(w, err, "internal server error")
 		return
 	}
 	http.Error(w, err.Error(), status)

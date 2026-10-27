@@ -474,6 +474,56 @@ func TestWritesGiveUpWhenTheACLKeepsChanging(t *testing.T) {
 	}
 }
 
+// A card whose contact keeps changing while the import retries it is reported
+// as the calendar import reports an event: imported when the contact already
+// holds what the card would store, else skipped as changed during the import,
+// never as a UID another contact uses.
+func TestImportReportsACardThatKeptChangingByWhatTheContactHolds(t *testing.T) {
+	const card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Imported\r\nEND:VCARD\r\n"
+	for _, tc := range []struct {
+		name         string
+		storedFirst  bool
+		wantImported int
+		wantSkip     ImportSkipCode
+	}{
+		{name: "the contact holds the card", storedFirst: true, wantImported: 1},
+		{name: "the contact holds other content", wantSkip: ImportSkipChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, aclRepo := newTestService()
+			if err := svc.ShareAddressBook(context.Background(), owner, 1, sharee.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			if tc.storedFirst {
+				if result, err := svc.ImportVCards(context.Background(), sharee, 1, card); err != nil || result.Imported != 1 {
+					t.Fatalf("first ImportVCards = %+v, %v", result, err)
+				}
+			}
+			contacts := svc.store.Contacts.(*fakeContacts)
+			before := contacts.items["1:c1"]
+			svc.store.ACLEntries = &churningACL{fakeACL: aclRepo, changes: 4 * maxUpdateAttempts}
+
+			result, err := svc.ImportVCards(context.Background(), sharee, 1, card)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Imported != tc.wantImported {
+				t.Errorf("imported %d, want %d: %+v", result.Imported, tc.wantImported, result)
+			}
+			var gotSkip ImportSkipCode
+			if len(result.Skipped) > 0 {
+				gotSkip = result.Skipped[0].Code
+			}
+			if gotSkip != tc.wantSkip || len(result.Skipped) > 1 {
+				t.Errorf("skipped %+v, want code %q", result.Skipped, tc.wantSkip)
+			}
+			if after := contacts.items["1:c1"]; after != before {
+				t.Errorf("the contact changed: %+v, was %+v", after, before)
+			}
+		})
+	}
+}
+
 // countingACL counts the reads of ACL entries.
 type countingACL struct {
 	*fakeACL

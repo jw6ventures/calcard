@@ -2,10 +2,13 @@ package config
 
 import (
 	"math"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
@@ -22,8 +25,11 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.DB.DSN != "postgres://dsn" {
+	if cfg.DB.DSN != "postgres://dsn?connect_timeout=5" {
 		t.Fatalf("DB.DSN = %q", cfg.DB.DSN)
+	}
+	if cfg.DB.ConnectTimeout != 5*time.Second {
+		t.Fatalf("DB.ConnectTimeout = %s, want 5s", cfg.DB.ConnectTimeout)
 	}
 	if !cfg.PrometheusEnabled {
 		t.Fatal("expected PrometheusEnabled")
@@ -446,9 +452,127 @@ func TestLoadBuildsDSNFromComponents(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	want := "postgres://user:pass@db:5433/calcard?sslmode=require"
+	want := "postgres://user:pass@db:5433/calcard?sslmode=require&connect_timeout=5"
 	if cfg.DB.DSN != want {
 		t.Fatalf("DB.DSN = %q, want %q", cfg.DB.DSN, want)
+	}
+}
+
+func TestLoadDefaultsConnectTimeoutWithoutOverridingTheOperator(t *testing.T) {
+	tests := []struct {
+		name    string
+		dsn     string
+		env     map[string]string
+		wantDSN string
+	}{
+		{
+			name:    "url without query",
+			dsn:     "postgres://u:p@db/app",
+			wantDSN: "postgres://u:p@db/app?connect_timeout=5",
+		},
+		{
+			name:    "url with query",
+			dsn:     "postgresql://u:p@db/app?sslmode=require",
+			wantDSN: "postgresql://u:p@db/app?sslmode=require&connect_timeout=5",
+		},
+		{
+			name:    "url with empty query",
+			dsn:     "postgres://u:p@db/app?",
+			wantDSN: "postgres://u:p@db/app?connect_timeout=5",
+		},
+		{
+			name:    "url that sets its own timeout",
+			dsn:     "postgres://u:p@db/app?connect_timeout=30&sslmode=disable",
+			wantDSN: "postgres://u:p@db/app?connect_timeout=30&sslmode=disable",
+		},
+		{
+			name:    "url that turns the timeout off",
+			dsn:     "postgres://u:p@db/app?connect_timeout=0",
+			wantDSN: "postgres://u:p@db/app?connect_timeout=0",
+		},
+		{
+			name:    "keyword/value",
+			dsn:     "host=db dbname=app",
+			wantDSN: "connect_timeout=5 host=db dbname=app",
+		},
+		{
+			name:    "keyword/value that sets its own timeout",
+			dsn:     "host=db connect_timeout = 30 dbname=app",
+			wantDSN: "connect_timeout=5 host=db connect_timeout = 30 dbname=app",
+		},
+		{
+			name:    "PGCONNECT_TIMEOUT is the operator's choice",
+			dsn:     "postgres://u:p@db/app",
+			env:     map[string]string{"PGCONNECT_TIMEOUT": "20"},
+			wantDSN: "postgres://u:p@db/app",
+		},
+		{
+			name:    "configured timeout rounds up to whole seconds",
+			dsn:     "postgres://u:p@db/app",
+			env:     map[string]string{"APP_DB_CONNECT_TIMEOUT": "2500ms"},
+			wantDSN: "postgres://u:p@db/app?connect_timeout=3",
+		},
+		{
+			name:    "zero leaves the DSN alone",
+			dsn:     "postgres://u:p@db/app",
+			env:     map[string]string{"APP_DB_CONNECT_TIMEOUT": "0"},
+			wantDSN: "postgres://u:p@db/app",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("PGCONNECT_TIMEOUT", "")
+			t.Setenv("APP_DB_DSN", tt.dsn)
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.DB.DSN != tt.wantDSN {
+				t.Fatalf("DB.DSN = %q, want %q", cfg.DB.DSN, tt.wantDSN)
+			}
+		})
+	}
+}
+
+// The default is prepended to a keyword/value DSN on the strength of lib/pq
+// letting a later keyword override an earlier one; this pins that behavior.
+func TestDefaultConnectTimeoutYieldsToTheOperatorsInLibPQ(t *testing.T) {
+	t.Setenv("PGCONNECT_TIMEOUT", "")
+	os.Unsetenv("PGCONNECT_TIMEOUT")
+	tests := []struct {
+		dsn  string
+		want time.Duration
+	}{
+		{dsn: "host=db dbname=app", want: 5 * time.Second},
+		{dsn: "host=db connect_timeout=30 dbname=app", want: 30 * time.Second},
+		{dsn: "host=db connect_timeout='0'", want: 0},
+		{dsn: "postgres://u:p@db/app?sslmode=disable", want: 5 * time.Second},
+		{dsn: "postgres://u:p@db/app?connect_timeout=30", want: 30 * time.Second},
+	}
+	for _, tt := range tests {
+		pqCfg, err := pq.NewConfig(withDefaultConnectTimeout(tt.dsn, 5*time.Second))
+		if err != nil {
+			t.Fatalf("pq.NewConfig(%q) error = %v", tt.dsn, err)
+		}
+		if pqCfg.ConnectTimeout != tt.want {
+			t.Fatalf("%q: ConnectTimeout = %s, want %s", tt.dsn, pqCfg.ConnectTimeout, tt.want)
+		}
+	}
+}
+
+func TestLoadRejectsBadConnectTimeout(t *testing.T) {
+	for _, value := range []string{"-1s", "soon"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DB_CONNECT_TIMEOUT", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "APP_DB_CONNECT_TIMEOUT") {
+				t.Fatalf("Load() error = %v, want APP_DB_CONNECT_TIMEOUT rejected", err)
+			}
+		})
 	}
 }
 
@@ -610,6 +734,92 @@ func TestLoadValidatesOAuthRedirectPath(t *testing.T) {
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), "APP_OAUTH_REDIRECT_PATH") {
 				t.Fatalf("Load() error = %v, want an APP_OAUTH_REDIRECT_PATH error", err)
+			}
+		})
+	}
+}
+
+func TestLoadRateLimits(t *testing.T) {
+	type limits struct {
+		authRPS   float64
+		authBurst int
+		davRPS    float64
+		davBurst  int
+	}
+	tests := []struct {
+		name string
+		env  map[string]string
+		want limits
+	}{
+		{name: "defaults", want: limits{authRPS: 5, authBurst: 10, davRPS: 20, davBurst: 100}},
+		{
+			name: "configured",
+			env: map[string]string{
+				"APP_RATE_LIMIT_AUTH_RPS":   "2.5",
+				"APP_RATE_LIMIT_AUTH_BURST": "4",
+				"APP_RATE_LIMIT_DAV_RPS":    " 7 ",
+				"APP_RATE_LIMIT_DAV_BURST":  "35",
+			},
+			want: limits{authRPS: 2.5, authBurst: 4, davRPS: 7, davBurst: 35},
+		},
+		{
+			name: "zero turns a limiter off",
+			env:  map[string]string{"APP_RATE_LIMIT_AUTH_RPS": "0", "APP_RATE_LIMIT_DAV_RPS": "0.0"},
+			want: limits{authRPS: 0, authBurst: DefaultAuthRateLimitBurst, davRPS: 0, davBurst: DefaultDAVRateLimitBurst},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			got := limits{
+				authRPS:   cfg.RateLimit.AuthRPS,
+				authBurst: cfg.RateLimit.AuthBurst,
+				davRPS:    cfg.RateLimit.DAVRPS,
+				davBurst:  cfg.RateLimit.DAVBurst,
+			}
+			if got != tt.want {
+				t.Fatalf("RateLimit = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A negative rate has no meaning, and a value that does not parse must not
+// fall back to the default. Zero is a valid rate: it turns the limiter off.
+func TestLoadRejectsInvalidRateLimits(t *testing.T) {
+	tests := []struct {
+		key     string
+		value   string
+		wantErr string
+	}{
+		{"APP_RATE_LIMIT_AUTH_RPS", "-1", "APP_RATE_LIMIT_AUTH_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_AUTH_RPS", "fast", "APP_RATE_LIMIT_AUTH_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_AUTH_RPS", "NaN", "APP_RATE_LIMIT_AUTH_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_AUTH_RPS", "Inf", "APP_RATE_LIMIT_AUTH_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_AUTH_BURST", "0", "APP_RATE_LIMIT_AUTH_BURST must be a positive integer"},
+		{"APP_RATE_LIMIT_AUTH_BURST", "-3", "APP_RATE_LIMIT_AUTH_BURST must be a positive integer"},
+		{"APP_RATE_LIMIT_AUTH_BURST", "1.5", "APP_RATE_LIMIT_AUTH_BURST must be a positive integer"},
+		{"APP_RATE_LIMIT_DAV_RPS", "-0.5", "APP_RATE_LIMIT_DAV_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_DAV_RPS", "+Inf", "APP_RATE_LIMIT_DAV_RPS must be a number of requests per second, 0 or more"},
+		{"APP_RATE_LIMIT_DAV_BURST", "0", "APP_RATE_LIMIT_DAV_BURST must be a positive integer"},
+		{"APP_RATE_LIMIT_DAV_BURST", "many", "APP_RATE_LIMIT_DAV_BURST must be a positive integer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(tt.key, tt.value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Load() error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}

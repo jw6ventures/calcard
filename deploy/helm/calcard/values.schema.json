@@ -31,7 +31,13 @@
               ]
             },
             "maxOpenConns": { "type": "integer", "minimum": 0 },
-            "maxIdleConns": { "type": "integer", "minimum": 0 }
+            "maxIdleConns": { "type": "integer", "minimum": 0 },
+            "connectTimeout": {
+              "oneOf": [
+                { "type": "string", "pattern": "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" },
+                { "type": "integer", "const": 0 }
+              ]
+            }
           }
         },
         "dav": {
@@ -53,6 +59,25 @@
                 { "type": "integer", "const": 0 }
               ]
             }
+          }
+        },
+        "rateLimit": {
+          "type": "object",
+          "properties": {
+            "authRps": {
+              "anyOf": [
+                { "type": "number", "minimum": 0 },
+                { "type": "string", "pattern": "^([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$" }
+              ]
+            },
+            "authBurst": { "type": "integer", "minimum": 1 },
+            "davRps": {
+              "anyOf": [
+                { "type": "number", "minimum": 0 },
+                { "type": "string", "pattern": "^([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$" }
+              ]
+            },
+            "davBurst": { "type": "integer", "minimum": 1 }
           }
         }
       }

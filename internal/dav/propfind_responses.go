@@ -225,7 +225,7 @@ func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.Us
 	}
 	canonicalPath, err := h.canonicalDAVPath(ctx, user, cleanPath)
 	if err != nil {
-		return nil, nil
+		return nil, collectionLookupFailure(err)
 	}
 	locks, err := h.store.Locks.ListByResource(ctx, canonicalPath)
 	if err != nil {

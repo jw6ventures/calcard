@@ -39,12 +39,12 @@ func (h *Handler) Calendars(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	calendars, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendars")
 		return
 	}
 	users, err := h.store.Users.ListActive(r.Context())
 	if err != nil {
-		http.Error(w, "failed to load users", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load users")
 		return
 	}
 
@@ -65,7 +65,7 @@ func (h *Handler) Calendars(w http.ResponseWriter, r *http.Request) {
 		if !cal.Shared {
 			shares, err := h.calendarShareViews(r.Context(), cal.ID, userMap)
 			if err != nil {
-				http.Error(w, "failed to load shares", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load shares")
 				return
 			}
 			cv.Shares = shares
@@ -118,6 +118,9 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	_, err = h.store.Calendars.Create(r.Context(), store.Calendar{UserID: user.ID, Name: name, Color: color})
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "failed to create"})
 		return
 	}
@@ -143,6 +146,9 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 	}
 	cal, err := h.store.Calendars.GetByID(r.Context(), id)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
 	}
@@ -169,6 +175,9 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		httperrors.LogError(r, "rename calendar", err)
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
@@ -229,6 +238,9 @@ func (h *Handler) deleteCalendarOnce(w http.ResponseWriter, r *http.Request, id 
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetByID(r.Context(), id)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "delete calendar", err)
 		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
 		return false
@@ -239,6 +251,9 @@ func (h *Handler) deleteCalendarOnce(w http.ResponseWriter, r *http.Request, id 
 	}
 	events, err := h.store.Events.ListForCalendar(r.Context(), id)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "delete calendar", err)
 		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
 		return false
@@ -257,6 +272,7 @@ func (h *Handler) deleteCalendarOnce(w http.ResponseWriter, r *http.Request, id 
 		SourceStatePath:    statePath,
 		Members:            members,
 		LockPreconditions:  []store.LockPrecondition{store.NewLockPrecondition(statePath), store.NewLockPrecondition(path.Dir(statePath))},
+		RevalidateMembers:  store.RemovedCalendarCollectionMembers,
 	})
 	switch {
 	case err == nil:
@@ -268,6 +284,9 @@ func (h *Handler) deleteCalendarOnce(w http.ResponseWriter, r *http.Request, id 
 		h.redirect(w, r, "/calendars", map[string]string{"error": calendarDeleteLockedMessage})
 		return false
 	default:
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "delete calendar", err)
 		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
 		return false
@@ -298,17 +317,26 @@ func (h *Handler) ShareCalendar(w http.ResponseWriter, r *http.Request) {
 
 	cal, err := h.store.Calendars.GetByID(r.Context(), calendarID)
 	if err != nil || cal == nil || cal.UserID != user.ID {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "not found"})
 		return
 	}
 
 	targetUser, err := h.store.Users.GetByID(r.Context(), targetID)
 	if err != nil || targetUser == nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "user not found"})
 		return
 	}
 
 	if err := h.setCalendarShare(r.Context(), cal.ID, targetUser.ID, true); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		if errors.Is(err, store.ErrLockConflict) {
 			h.redirect(w, r, "/calendars", map[string]string{"error": calendarLockedMessage})
 			return
@@ -340,6 +368,9 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 
 	calAccess, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil || calAccess == nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "not found"})
 		return
 	}
@@ -347,6 +378,9 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 	if calAccess.UserID == user.ID {
 		// Owner removing a share
 		if err := h.removeCalendarShare(r.Context(), calendarID, targetID); err != nil {
+			if writeStoreUnavailable(w, err) {
+				return
+			}
 			h.redirect(w, r, "/calendars", map[string]string{"error": "failed to unshare"})
 			return
 		}
@@ -357,6 +391,9 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.removeCalendarShare(r.Context(), calendarID, user.ID); err != nil {
+			if writeStoreUnavailable(w, err) {
+				return
+			}
 			h.redirect(w, r, "/calendars", map[string]string{"error": "failed to leave"})
 			return
 		}
@@ -786,7 +823,7 @@ func (h *Handler) ViewCalendar(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), id, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	}
 	if cal == nil {
@@ -824,7 +861,7 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), id, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	}
 	if cal == nil {
@@ -835,12 +872,12 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	// Fetch all events for the calendar
 	allEvents, err := h.store.Events.ListForCalendar(r.Context(), id)
 	if err != nil {
-		http.Error(w, "failed to load events", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load events")
 		return
 	}
 	allEvents, err = h.filterReadableCalendarEvents(r.Context(), user, cal, allEvents)
 	if err != nil {
-		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate event access")
 		return
 	}
 
@@ -887,7 +924,7 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	calendars, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendars")
 		return
 	}
 
@@ -907,7 +944,7 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 			"bind",
 		)
 		if err != nil {
-			http.Error(w, "failed to evaluate calendar access", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate calendar access")
 			return
 		}
 		metas = append(metas, calendarMeta{
@@ -1071,7 +1108,7 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 	user, _ := auth.UserFromContext(r.Context())
 	calendars, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendars")
 		return
 	}
 
@@ -1102,7 +1139,7 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		// write-content, and unbind for every windowed event in memory.
 		decide, err := h.calendarPrivilegeDecider(r.Context(), user, &cal, windowed)
 		if err != nil {
-			http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate event access")
 			return
 		}
 
@@ -1147,7 +1184,7 @@ func (h *Handler) ExportCalendar(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	}
 	if cal == nil {
@@ -1155,18 +1192,21 @@ func (h *Handler) ExportCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarACLResourcePath(calendarID), "read"); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	events, err := h.store.Events.ListForCalendar(r.Context(), calendarID)
 	if err != nil {
-		http.Error(w, "failed to load events", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load events")
 		return
 	}
 	events, err = h.filterReadableCalendarEvents(r.Context(), user, cal, events)
 	if err != nil {
-		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate event access")
 		return
 	}
 
@@ -1359,13 +1399,19 @@ const (
 	// importChanged: the event or the access that decided its write changed
 	// before it was written.
 	importChanged
+	// importUnavailable: the store could not be reached, so the rest of the
+	// import cannot be written either.
+	importUnavailable
 )
 
 // writeImportedEvent writes one event of an import as a UI create or edit is
 // written: only over the version it was decided on, only while the ACL it was
 // decided on holds, and only past the locks a CalDAV request submitting no
-// token would meet. A write that loses to a change of the ACL alone is decided
-// again once, and goes on when that finds the event as it was.
+// token would meet. A write that loses to another writer is decided again: it
+// counts as written when the caller may write the event and finds it already
+// holding the octets the import would store, as when another import of the
+// same file wins the race. A write that loses to a change of the ACL alone
+// goes on, once, when that finds the event as it was.
 func (h *Handler) writeImportedEvent(ctx context.Context, r *http.Request, user *store.User, cal *store.CalendarAccess, item importItem) importOutcome {
 	for attempt := 1; ; attempt++ {
 		var err error
@@ -1379,26 +1425,38 @@ func (h *Handler) writeImportedEvent(ctx context.Context, r *http.Request, user 
 			return importWritten
 		case errors.Is(err, store.ErrLockConflict):
 			return importLocked
-		case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrUIDConflict):
-			return importChanged
-		case errors.Is(err, store.ErrResourceStateChanged):
-			if attempt == 2 {
-				return importChanged
-			}
+		case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrResourceStateChanged):
 			existing, guard, allowed, decideErr := h.importTarget(ctx, user, cal, item.event.UID)
 			if decideErr != nil {
-				httperrors.LogError(r, "import event", decideErr)
-				return importFailed
+				return importFailure(r, decideErr)
 			}
-			if !allowed || !sameStoredVersion(existing, item.existing) {
+			if allowed && holdsImportedContent(existing, item.event) {
+				return importWritten
+			}
+			aclChangedAlone := errors.Is(err, store.ErrResourceStateChanged) && sameStoredVersion(existing, item.existing)
+			if attempt == 2 || !allowed || !aclChangedAlone {
 				return importChanged
 			}
 			item.guard = guard
 		default:
-			httperrors.LogError(r, "import event", err)
-			return importFailed
+			return importFailure(r, err)
 		}
 	}
+}
+
+// holdsImportedContent reports whether stored is the event an import of event
+// would leave: the same UID holding the same calendar data.
+func holdsImportedContent(stored *store.Event, event store.Event) bool {
+	return stored != nil && stored.UID == event.UID && stored.RawICAL == event.RawICAL
+}
+
+// importFailure is the outcome of an event whose write failed with err.
+func importFailure(r *http.Request, err error) importOutcome {
+	if store.IsUnavailable(err) {
+		return importUnavailable
+	}
+	httperrors.LogError(r, "import event", err)
+	return importFailed
 }
 
 // sameStoredVersion reports whether a and b are the same version of one event,
@@ -1446,7 +1504,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	}
 	if cal == nil {
@@ -1457,7 +1515,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	// upload is read, so none of it is validated.
 	access, err := h.calendarImportAccess(r.Context(), user, cal)
 	if err != nil {
-		http.Error(w, "failed to check calendar access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to check calendar access")
 		return
 	}
 	if access == importForbidden {
@@ -1519,7 +1577,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			allowed := false
 			existing, guard, allowed, err = h.importTarget(r.Context(), user, cal, uid)
 			if err != nil {
-				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load event")
 				return
 			}
 			if !allowed {
@@ -1537,7 +1595,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			allowed := false
 			existing, guard, allowed, err = h.importTarget(r.Context(), user, cal, uid)
 			if err != nil {
-				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load event")
 				return
 			}
 			if !allowed {
@@ -1552,7 +1610,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		if existing == nil {
 			if event.ResourceName, err = h.unclaimedImportName(r.Context(), cal.ID, uid, claimed); err != nil {
-				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load event")
 				return
 			}
 		}
@@ -1566,7 +1624,12 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	// the others to go on.
 	counts := map[importOutcome]int{}
 	for _, item := range pending {
-		counts[h.writeImportedEvent(r.Context(), r, user, cal, item)]++
+		outcome := h.writeImportedEvent(r.Context(), r, user, cal, item)
+		if outcome == importUnavailable {
+			writeServiceUnavailable(w)
+			return
+		}
+		counts[outcome]++
 	}
 	imported, failed := counts[importWritten], counts[importFailed]
 
@@ -1673,7 +1736,7 @@ func (h *Handler) createEventOnce(w http.ResponseWriter, r *http.Request, calend
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return false
 	}
 	if cal == nil {
@@ -1715,12 +1778,15 @@ func (h *Handler) createEventOnce(w http.ResponseWriter, r *http.Request, calend
 	uid := utils.GenerateUID()
 	guard, err := h.pinEventACL(r.Context(), user, eventACLScope{calendarID: calendarID, calendar: &cal.Calendar})
 	if err != nil {
-		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate event access")
 		return false
 	}
 	// DAV:bind is a privilege of the calendar the event joins (RFC 3744
 	// section 3.9), so no ACL stored for a member bears on it.
 	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarACLResourcePath(calendarID), "bind"); err != nil {
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
@@ -1747,6 +1813,9 @@ func (h *Handler) createEventOnce(w http.ResponseWriter, r *http.Request, calend
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
 		return false
 	case err != nil:
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "failed to create event", err)
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to create event"})
 		return false
@@ -1799,7 +1868,7 @@ func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calend
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return false
 	}
 	if cal == nil {
@@ -1847,7 +1916,7 @@ func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calend
 
 		destinationCalendar, err = h.store.Calendars.GetAccessible(r.Context(), destinationCalendarID, user.ID)
 		if err != nil {
-			http.Error(w, "failed to load destination calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load destination calendar")
 			return false
 		}
 		if destinationCalendar == nil {
@@ -1857,6 +1926,9 @@ func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calend
 		// DAV:bind is a privilege of the calendar the event joins (RFC 3744
 		// section 3.9), so no ACL stored for a member bears on it.
 		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, calendarACLResourcePath(destinationCalendarID), "bind"); err != nil {
+			if writeStoreUnavailable(w, err) {
+				return false
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return false
 		}
@@ -1867,12 +1939,12 @@ func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calend
 
 		existingByUID, err := h.store.Events.GetByUID(r.Context(), destinationCalendarID, uid)
 		if err != nil {
-			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to check destination calendar")
 			return false
 		}
 		existingByName, err := h.store.Events.GetByResourceName(r.Context(), destinationCalendarID, resourceName)
 		if err != nil {
-			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to check destination calendar")
 			return false
 		}
 		if existingByUID != nil || existingByName != nil {
@@ -1998,6 +2070,9 @@ func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calend
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar already contains this event"})
 		return false
 	default:
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "failed to update event", err)
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to update event"})
 		return false
@@ -2048,7 +2123,7 @@ func (h *Handler) deleteEventOnce(w http.ResponseWriter, r *http.Request, calend
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return false
 	}
 	if cal == nil {
@@ -2116,6 +2191,9 @@ func (h *Handler) deleteEventOnce(w http.ResponseWriter, r *http.Request, calend
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
 			return false
 		default:
+			if writeStoreUnavailable(w, err) {
+				return false
+			}
 			httperrors.LogError(r, "failed to delete occurrence", err)
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete occurrence"})
 			return false
@@ -2126,7 +2204,7 @@ func (h *Handler) deleteEventOnce(w http.ResponseWriter, r *http.Request, calend
 
 	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
 	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load event")
 		return false
 	}
 	resourceName := ""
@@ -2135,7 +2213,7 @@ func (h *Handler) deleteEventOnce(w http.ResponseWriter, r *http.Request, calend
 	}
 	guard, err := h.pinEventACL(r.Context(), user, eventACLScope{calendarID: calendarID, calendar: &cal.Calendar, resourceName: resourceName})
 	if err != nil {
-		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate event access")
 		return false
 	}
 	if existing, err = h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
@@ -2169,6 +2247,9 @@ func (h *Handler) deleteEventState(w http.ResponseWriter, r *http.Request, calen
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
 		return false
 	default:
+		if writeStoreUnavailable(w, err) {
+			return false
+		}
 		httperrors.LogError(r, "failed to delete event", err)
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
 		return false
@@ -2184,7 +2265,7 @@ func (h *Handler) deleteEventState(w http.ResponseWriter, r *http.Request, calen
 func (h *Handler) authorizedEventWrite(w http.ResponseWriter, r *http.Request, user *store.User, cal *store.CalendarAccess, uid string, also ...eventACLScope) (*store.Event, *store.ACLGuard, bool) {
 	existing, err := h.store.Events.GetByUID(r.Context(), cal.ID, uid)
 	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load event")
 		return nil, nil, false
 	}
 	resourceName := ""
@@ -2193,7 +2274,7 @@ func (h *Handler) authorizedEventWrite(w http.ResponseWriter, r *http.Request, u
 	}
 	guard, err := h.pinEventACL(r.Context(), user, append([]eventACLScope{{calendarID: cal.ID, calendar: &cal.Calendar, resourceName: resourceName}}, also...)...)
 	if err != nil {
-		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate event access")
 		return nil, nil, false
 	}
 	if _, existing, err = h.events.AuthorizeEventWrite(r.Context(), user, cal.ID, existing, "write-content"); err != nil {
@@ -2223,7 +2304,7 @@ func writeEventAccessError(w http.ResponseWriter, err error) {
 	case errors.Is(err, events.ErrForbidden):
 		http.Error(w, "forbidden", http.StatusForbidden)
 	default:
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load event")
 	}
 }
 

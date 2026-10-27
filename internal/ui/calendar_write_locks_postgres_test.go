@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +280,77 @@ func TestPostgres_UICalendarDeleteRemovesTheStateBeneathIt(t *testing.T) {
 		if entries, err := f.database.ACLEntries.ListByResource(t.Context(), resourcePath); err != nil || len(entries) != 0 {
 			t.Errorf("ACL entries left at %s: %v, %v", resourcePath, entries, err)
 		}
+	}
+}
+
+// Deleting a calendar that CalDAV clients on other replicas keep writing to
+// holds the calendar while it removes it, so the writers queue behind the
+// delete instead of making it give up, and nothing they wrote outlives it.
+func TestPostgres_UICalendarDeleteUnderContinuousMemberWrites(t *testing.T) {
+	const writers = 4
+	f := newUIEventFixture(t)
+	calendar := f.calendarOf(f.sharee, "Doomed")
+	root := shareeCalendarPath(calendar.ID)
+	var ops atomic.Int64
+	var mu sync.Mutex
+	var serverErrors []string
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < writers; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			header := map[string]string{"Content-Type": "text/calendar"}
+			for k := 0; ; k++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				uid := fmt.Sprintf("w%d-%d", g, k)
+				href := root + "/" + uid + ".ics"
+				for _, rr := range []*httptest.ResponseRecorder{
+					f.davRequest(f.sharee, http.MethodPut, href, header, eventObject(singleEvent, uid)),
+					f.davRequest(f.sharee, http.MethodDelete, href, nil, ""),
+				} {
+					if rr.Code >= 500 {
+						mu.Lock()
+						serverErrors = append(serverErrors, fmt.Sprintf("%s = %d %s", uid, rr.Code, rr.Body.String()))
+						mu.Unlock()
+					}
+				}
+				f.davRequest(f.sharee, http.MethodPut, root+"/"+uid+"-kept.ics", header, eventObject(singleEvent, uid+"-kept"))
+				ops.Add(1)
+			}
+		}(g)
+	}
+	waitForOps := func(n int64) {
+		target := ops.Load() + n
+		deadline := time.Now().Add(30 * time.Second)
+		for ops.Load() < target {
+			if time.Now().After(deadline) {
+				t.Fatalf("writers made %d operations, want %d", ops.Load(), target)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitForOps(writers * 10)
+	rr := f.serveCalendar(f.handler.DeleteCalendar, map[string]string{"id": strconv.FormatInt(calendar.ID, 10)}, nil)
+	waitForOps(writers * 10)
+	close(stop)
+	wg.Wait()
+
+	if got := flashedErrorOf(rr); got != "" {
+		t.Fatalf("the delete was refused: %q", got)
+	}
+	for _, failure := range serverErrors {
+		t.Errorf("member write failed on the server: %s", failure)
+	}
+	if remains, err := f.database.Calendars.GetByID(t.Context(), calendar.ID); err == nil && remains != nil {
+		t.Fatalf("calendar remains after its delete: %#v", remains)
+	}
+	if events, err := f.database.Events.ListForCalendar(t.Context(), calendar.ID); err != nil || len(events) != 0 {
+		t.Fatalf("%d members outlive their calendar: %v", len(events), err)
 	}
 }
 

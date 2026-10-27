@@ -422,9 +422,13 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 		claimed, err := s.acceptDigestNonceCount(r.Context(), token.ID, params["nonce"], uint32(nonceCount64))
 		if err != nil {
 			// The credential itself checked out; only the replay-guard write
-			// failed. stale=true lets a well-behaved client retry with a fresh
-			// nonce instead of re-prompting the user for credentials that were
-			// never the problem.
+			// failed. A store that cannot be reached is answered as the
+			// outage it is. Otherwise stale=true lets a well-behaved client
+			// retry with a fresh nonce instead of re-prompting the user for
+			// credentials that were never the problem.
+			if store.IsUnavailable(err) {
+				return nil, false, credentialLookupError(err)
+			}
 			s.logger().Error("dav_digest", "replay guard unavailable for app password %d: %v", token.ID, err)
 			return nil, true, errors.New("digest replay guard unavailable")
 		}

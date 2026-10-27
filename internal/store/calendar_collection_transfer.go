@@ -78,6 +78,20 @@ type CalendarCollectionTransfer struct {
 	// ExpectedACL pins the ACL entries the source and destination privilege
 	// checks read.
 	ExpectedACL *ACLGuard
+
+	// RevalidateMembers, when set, lets a transfer of the source's members
+	// proceed from the members stored once its locks are held instead of
+	// failing because they differ from Members. Those locks keep every member
+	// writer of the source and of an existing destination out until the
+	// transfer commits, so it transfers the source as it stands and replaces
+	// the destination as it stands: neither ExpectedSourceCTag nor the CTag of
+	// ExpectedDestination is compared, while the destination's identity still
+	// is. It is called with each stored member that Members does not match
+	// exactly and the ACL entries stored at those members' paths, and returns
+	// each of them as a member to transfer, or an error that the transfer
+	// fails with. It runs while the collection's writers wait on the
+	// transaction, so it must not reach the database itself.
+	RevalidateMembers func(ctx context.Context, changed []Event, acl []ACLEntry) ([]CalendarCollectionMember, error)
 }
 
 // CalendarCollectionTransferResult reports the resulting collection, if the
@@ -98,7 +112,8 @@ type CalendarCollectionTransferBackend interface {
 // in a single transaction. The source is verified against the ctag and member
 // set the caller preflighted, so a collection that changed underneath the
 // request fails with ErrResourceStateChanged instead of transferring a mixture
-// of old and new state.
+// of old and new state, unless the transfer carries RevalidateMembers, which
+// brings the members that changed up to date under the transaction's locks.
 func (s *Store) TransferCalendarCollection(ctx context.Context, transfer CalendarCollectionTransfer) (*CalendarCollectionTransferResult, error) {
 	if s == nil || s.Calendars == nil {
 		return nil, ErrNotFound
@@ -106,12 +121,8 @@ func (s *Store) TransferCalendarCollection(ctx context.Context, transfer Calenda
 	if transfer.Operation != CalendarCollectionCopy && transfer.Operation != CalendarCollectionMove && transfer.Operation != CalendarCollectionDelete {
 		return nil, fmt.Errorf("unsupported calendar collection transfer operation %q", transfer.Operation)
 	}
-	if calendarCollectionTransferStoresMembers(transfer) {
-		for _, member := range transfer.Members {
-			if member.RawICAL == "" || transfer.Operation == CalendarCollectionCopy && member.NewETag == "" {
-				return nil, fmt.Errorf("calendar collection member %q has no body or ETag to store", member.ResourceName)
-			}
-		}
+	if err := checkCalendarCollectionMembersStorable(transfer, transfer.Members); err != nil {
+		return nil, err
 	}
 	if s.pool == nil {
 		if s.CalendarCollections == nil {
@@ -166,11 +177,11 @@ func transferCalendarCollectionTx(ctx context.Context, tx *sql.Tx, transfer Cale
 	if source == nil {
 		return nil, ErrNotFound
 	}
-	if source.CTag != transfer.ExpectedSourceCTag {
+	if source.CTag != transfer.ExpectedSourceCTag && transfer.RevalidateMembers == nil {
 		return nil, ErrResourceStateChanged
 	}
-	validateExactMemberSet := transfer.Operation != CalendarCollectionCopy || transfer.Depth != "0"
-	if err := validateCalendarCollectionMembersTx(ctx, tx, source.ID, transfer.Members, validateExactMemberSet); err != nil {
+	transfer.Members, err = lockCalendarCollectionMembersTx(ctx, tx, source.ID, transfer)
+	if err != nil {
 		return nil, err
 	}
 
@@ -199,7 +210,7 @@ func transferCalendarCollectionTx(ctx context.Context, tx *sql.Tx, transfer Cale
 	if err != nil {
 		return nil, err
 	}
-	if !calendarCollectionStateMatches(transfer.ExpectedDestination, destination) {
+	if !calendarCollectionStateMatches(transfer.ExpectedDestination, destination, transfer.RevalidateMembers == nil) {
 		return nil, ErrResourceStateChanged
 	}
 	if destination != nil && destination.ID == source.ID {
@@ -541,23 +552,94 @@ func scanCalendar(scan rowScanner) (Calendar, error) {
 	return calendar, nil
 }
 
-func validateCalendarCollectionMembersTx(ctx context.Context, tx *sql.Tx, calendarID int64, members []CalendarCollectionMember, exact bool) error {
+// lockCalendarCollectionMembersTx locks the members of calendar calendarID and
+// returns the members transfer moves, copies or guards on: its own Members
+// when they match what is stored, and otherwise, when it can revalidate them,
+// the stored members, reusing each of its Members that still matches.
+func lockCalendarCollectionMembersTx(ctx context.Context, tx *sql.Tx, calendarID int64, transfer CalendarCollectionTransfer) ([]CalendarCollectionMember, error) {
 	query := `SELECT ` + calendarObjectColumns + ` FROM events WHERE calendar_id=$1 ORDER BY id FOR UPDATE`
 	rows, err := tx.QueryContext(ctx, query, calendarID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
-	storedByName := make(map[string]Event)
+	var stored []Event
 	for rows.Next() {
 		event, err := scanEvent(rows.Scan)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		storedByName[storedResourceName(event)] = event
+		stored = append(stored, event)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
+	}
+	exact := transfer.Operation != CalendarCollectionCopy || transfer.Depth != "0"
+	members := transfer.Members
+	if exact && transfer.RevalidateMembers != nil {
+		if members, err = revalidateCalendarCollectionMembersTx(ctx, tx, stored, transfer); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateCalendarCollectionMembers(stored, members, exact); err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
+// revalidateCalendarCollectionMembersTx returns stored as members, in stored
+// order: each of transfer's Members that still matches its stored row as it
+// is, and the rest as transfer's RevalidateMembers returns them.
+func revalidateCalendarCollectionMembersTx(ctx context.Context, tx *sql.Tx, stored []Event, transfer CalendarCollectionTransfer) ([]CalendarCollectionMember, error) {
+	supplied := make(map[int64]CalendarCollectionMember, len(transfer.Members))
+	for _, member := range transfer.Members {
+		supplied[member.ID] = member
+	}
+	var changed []Event
+	var changedPaths []string
+	for _, event := range stored {
+		if member, ok := supplied[event.ID]; !ok || !calendarCollectionMemberMatches(event, member) {
+			changed = append(changed, event)
+			changedPaths = append(changedPaths, MemberStatePath(transfer.SourceStatePath, storedResourceName(event)))
+		}
+	}
+	if len(changed) == 0 && len(stored) == len(transfer.Members) {
+		return transfer.Members, nil
+	}
+	revalidated := make(map[int64]CalendarCollectionMember, len(changed))
+	if len(changed) != 0 {
+		entries, err := aclEntriesTx(ctx, tx, changedPaths)
+		if err != nil {
+			return nil, err
+		}
+		members, err := transfer.RevalidateMembers(ctx, changed, entries)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCalendarCollectionMembersStorable(transfer, members); err != nil {
+			return nil, err
+		}
+		for _, member := range members {
+			revalidated[member.ID] = member
+		}
+	}
+	members := make([]CalendarCollectionMember, 0, len(stored))
+	for _, event := range stored {
+		member, ok := revalidated[event.ID]
+		if !ok {
+			member = supplied[event.ID]
+		}
+		members = append(members, member)
+	}
+	return members, nil
+}
+
+// validateCalendarCollectionMembers refuses members that do not each match a
+// stored member exactly, or, when exact, do not name every stored member.
+func validateCalendarCollectionMembers(stored []Event, members []CalendarCollectionMember, exact bool) error {
+	storedByName := make(map[string]Event, len(stored))
+	for _, event := range stored {
+		storedByName[storedResourceName(event)] = event
 	}
 	if exact && len(storedByName) != len(members) {
 		return ErrResourceStateChanged
@@ -568,19 +650,37 @@ func validateCalendarCollectionMembersTx(ctx context.Context, tx *sql.Tx, calend
 			return ErrResourceStateChanged
 		}
 		seen[member.ResourceName] = struct{}{}
-		stored, exists := storedByName[member.ResourceName]
-		if !exists || stored.ID != member.ID || stored.UID != member.UID || stored.ETag != member.ETag || stored.RawICAL != member.RawICAL {
+		event, exists := storedByName[member.ResourceName]
+		if !exists || !calendarCollectionMemberMatches(event, member) {
 			return ErrResourceStateChanged
 		}
 	}
 	return nil
 }
 
-func calendarCollectionStateMatches(expected CalendarCollectionState, calendar *Calendar) bool {
+func calendarCollectionMemberMatches(event Event, member CalendarCollectionMember) bool {
+	return event.ID == member.ID && event.UID == member.UID && event.ETag == member.ETag && event.RawICAL == member.RawICAL &&
+		storedResourceName(event) == member.ResourceName
+}
+
+func calendarCollectionStateMatches(expected CalendarCollectionState, calendar *Calendar, compareCTag bool) bool {
 	if expected.Exists != (calendar != nil) {
 		return false
 	}
-	return calendar == nil || expected.ID == calendar.ID && expected.CTag == calendar.CTag
+	return calendar == nil || expected.ID == calendar.ID && (!compareCTag || expected.CTag == calendar.CTag)
+}
+
+// RemovedCalendarCollectionMembers is the RevalidateMembers of a DELETE, which
+// stores none of the members it removes and so takes each changed member as
+// it is stored.
+func RemovedCalendarCollectionMembers(_ context.Context, changed []Event, _ []ACLEntry) ([]CalendarCollectionMember, error) {
+	members := make([]CalendarCollectionMember, 0, len(changed))
+	for _, event := range changed {
+		members = append(members, CalendarCollectionMember{
+			ID: event.ID, UID: event.UID, ResourceName: storedResourceName(event), RawICAL: event.RawICAL, ETag: event.ETag,
+		})
+	}
+	return members, nil
 }
 
 func calendarCollectionMemberMetadata(member CalendarCollectionMember) EventWriteMetadata {
@@ -591,6 +691,20 @@ func calendarCollectionMemberMetadata(member CalendarCollectionMember) EventWrit
 	metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(member.RawICAL)
 	metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(member.RawICAL)
 	return metadata
+}
+
+// checkCalendarCollectionMembersStorable refuses members that transfer stores
+// when one has no body, or, for a COPY, no ETag for its copy.
+func checkCalendarCollectionMembersStorable(transfer CalendarCollectionTransfer, members []CalendarCollectionMember) error {
+	if !calendarCollectionTransferStoresMembers(transfer) {
+		return nil
+	}
+	for _, member := range members {
+		if member.RawICAL == "" || transfer.Operation == CalendarCollectionCopy && member.NewETag == "" {
+			return fmt.Errorf("calendar collection member %q has no body or ETag to store", member.ResourceName)
+		}
+	}
+	return nil
 }
 
 // calendarCollectionTransferStoresMembers reports whether the transfer writes

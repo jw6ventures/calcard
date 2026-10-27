@@ -133,7 +133,7 @@ func writeSourceResolutionError(w http.ResponseWriter, err error) {
 		http.Error(w, "source not found", http.StatusNotFound)
 		return
 	}
-	http.Error(w, "failed to resolve source", http.StatusInternalServerError)
+	writeServerFailure(w, err, "failed to resolve source")
 }
 
 func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +198,7 @@ func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, us
 func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {
 	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	if _, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read"); err != nil {
@@ -207,7 +207,11 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 
 	src, err := h.store.Events.GetByResourceName(r.Context(), srcCalID, srcUID)
-	if err != nil || src == nil {
+	if err != nil {
+		writeServerFailure(w, err, "failed to load source event")
+		return
+	}
+	if src == nil {
 		http.Error(w, "source event not found", http.StatusNotFound)
 		return
 	}
@@ -217,6 +221,9 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 	destCalID, destResourceName, destMatched, err := h.parseCalendarResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
@@ -227,7 +234,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 
 	existing, err := h.store.Events.GetByResourceName(r.Context(), destCalID, destResourceName)
 	if err != nil {
-		http.Error(w, "failed to load destination event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination event")
 		return
 	}
 	loadPrivilege := "bind"
@@ -271,7 +278,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 	existingByUID, err := h.store.Events.GetByUID(r.Context(), destCalID, src.UID)
 	if err != nil {
-		http.Error(w, "failed to load destination event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination event")
 		return
 	}
 	if existingByUID != nil {
@@ -300,7 +307,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	etag := newCopyETag(validated.Body, destCalID)
 	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource state paths")
 		return
 	}
 	lockPreconditions, ok := h.writeLockPreconditions(w, r, destPath, path.Dir(destPath))
@@ -335,7 +342,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		if h.writeCalendarTransferError(w, r, err, result, destCalID, destResourceName, src.UID) {
 			return
 		}
-		http.Error(w, "failed to copy event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to copy event")
 		return
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
@@ -354,11 +361,14 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
 	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	srcBook, err := h.getAddressBook(r.Context(), srcBookID)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "source not found", http.StatusNotFound)
 		return
 	}
@@ -368,7 +378,7 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	src, err := h.store.Contacts.GetByResourceName(r.Context(), srcBookID, srcUID)
 	if err != nil {
-		http.Error(w, "failed to load source contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load source contact")
 		return
 	}
 	if src == nil {
@@ -382,6 +392,9 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
@@ -391,13 +404,16 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "destination not found", http.StatusNotFound)
 		return
 	}
 
 	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), destBookID, destResourceName)
 	if err != nil {
-		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination contact")
 		return
 	}
 	if !h.authorizeAddressBookDestination(w, r, user, destBook, destPath, existingByName,
@@ -432,7 +448,7 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), destBookID, src.UID)
 	if err != nil {
-		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination contact")
 		return
 	}
 	if existingByUID != nil {
@@ -447,7 +463,7 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 
 	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource state paths")
 		return
 	}
 	replacedUID := ""
@@ -489,7 +505,7 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
-		http.Error(w, "failed to copy contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to copy contact")
 		return
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
@@ -581,7 +597,7 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {
 	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	sourceParent := path.Dir(srcPath(r))
@@ -600,7 +616,11 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		return
 	}
 	src, err := h.store.Events.GetByResourceName(r.Context(), srcCalID, srcUID)
-	if err != nil || src == nil {
+	if err != nil {
+		writeServerFailure(w, err, "failed to load source event")
+		return
+	}
+	if src == nil {
 		http.Error(w, "source event not found", http.StatusNotFound)
 		return
 	}
@@ -614,6 +634,9 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 
 	destCalID, destResourceName, destMatched, err := h.parseCalendarResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
@@ -624,7 +647,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 
 	existing, err := h.store.Events.GetByResourceName(r.Context(), destCalID, destResourceName)
 	if err != nil {
-		http.Error(w, "failed to load destination event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination event")
 		return
 	}
 	loadPrivilege := "bind"
@@ -655,7 +678,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 	existingByUID, err := h.store.Events.GetByUID(r.Context(), destCalID, src.UID)
 	if err != nil {
-		http.Error(w, "failed to load destination event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination event")
 		return
 	}
 	if existingByUID != nil {
@@ -677,7 +700,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 
 	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource state paths")
 		return
 	}
 	lockPreconditions, ok := h.writeLockPreconditions(w, r, srcPath(r), path.Dir(srcPath(r)), destPath, path.Dir(destPath))
@@ -711,7 +734,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		if h.writeCalendarTransferError(w, r, err, result, destCalID, destResourceName, src.UID) {
 			return
 		}
-		http.Error(w, "failed to move event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to move event")
 		return
 	}
 
@@ -760,7 +783,7 @@ func (h *DavServer) writeCalendarCopyMoveConflict(w http.ResponseWriter, r *http
 	existing, resourceErr := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
 	byUID, uidErr := h.store.Events.GetByUID(r.Context(), calendarID, uid)
 	if resourceErr != nil || uidErr != nil {
-		http.Error(w, "failed to load conflicting event", http.StatusInternalServerError)
+		writeServerFailure(w, errors.Join(resourceErr, uidErr), "failed to load conflicting event")
 		return
 	}
 	var conflict *store.Event
@@ -783,11 +806,14 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
 	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	srcBook, err := h.getAddressBook(r.Context(), srcBookID)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "source not found", http.StatusNotFound)
 		return
 	}
@@ -803,7 +829,7 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	src, err := h.store.Contacts.GetByResourceName(r.Context(), srcBookID, srcUID)
 	if err != nil {
-		http.Error(w, "failed to load source contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load source contact")
 		return
 	}
 	if src == nil {
@@ -820,6 +846,9 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
@@ -829,13 +858,16 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
+		if writeStoreUnavailable(w, err) {
+			return
+		}
 		http.Error(w, "destination not found", http.StatusNotFound)
 		return
 	}
 
 	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), destBookID, destResourceName)
 	if err != nil {
-		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination contact")
 		return
 	}
 	if !h.authorizeAddressBookDestination(w, r, user, destBook, destPath, existingByName, privilegeAt{"unbind", path.Dir(destPath)}) {
@@ -863,7 +895,7 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 	}
 	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), destBookID, src.UID)
 	if err != nil {
-		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load destination contact")
 		return
 	}
 	if existingByUID != nil {
@@ -877,7 +909,7 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 
 	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource state paths")
 		return
 	}
 	replacedUID := ""
@@ -918,7 +950,7 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
-		http.Error(w, "failed to move contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to move contact")
 		return
 	}
 
@@ -934,7 +966,7 @@ func (h *DavServer) writeContactCopyMoveConflict(w http.ResponseWriter, r *http.
 	existing, resourceErr := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	byUID, uidErr := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
 	if resourceErr != nil || uidErr != nil {
-		http.Error(w, "failed to load conflicting contact", http.StatusInternalServerError)
+		writeServerFailure(w, errors.Join(resourceErr, uidErr), "failed to load conflicting contact")
 		return
 	}
 	var conflict *store.Contact

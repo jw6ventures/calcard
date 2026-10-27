@@ -41,7 +41,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous calendar path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	} else if matched {
 		if calendarID == birthdayCalendarID {
@@ -51,7 +51,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 					writeInsufficientStorage(w)
 					return
 				}
-				http.Error(w, "failed to load birthday events", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load birthday events")
 				return
 			}
 
@@ -80,13 +80,13 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load calendar")
 			return
 		}
 		event, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
 		if err != nil {
 			h.logger().Error("Get", "failed to load event %q from calendar %d: %v", uid, calendarID, err)
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load event")
 			return
 		}
 		if event == nil {
@@ -111,7 +111,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous address book path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address book")
 		return
 	} else if matched {
 		if _, err := h.loadAddressBookWithPrivilege(r.Context(), user, addressBookID, cleanPath, "read"); err != nil {
@@ -124,7 +124,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.Error(w, "failed to load address book", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load address book")
 			return
 		}
 		h.writeAddressBookContact(w, r, addressBookID, resourceName)
@@ -138,7 +138,7 @@ func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Reque
 	contact, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
 		h.logger().Error("writeAddressBookContact", "failed to load contact %q from address book %d: %v", resourceName, addressBookID, err)
-		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load contact")
 		return
 	}
 	if contact == nil {

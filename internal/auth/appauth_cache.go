@@ -10,16 +10,17 @@ import (
 )
 
 const (
-	// authCacheTTL is the longest a validated app-password is trusted before we
-	// re-run the full GetByEmail/FindValidByUser/bcrypt validation. An entry is
-	// never given more than this and never more than the credential's own
-	// remaining validity, whichever is shorter.
+	// authCacheTTL is the longest a bcrypt match is reused before we re-run the
+	// full GetByEmail/FindValidByUser/bcrypt validation. An entry is never given
+	// more than this and never more than the credential's own remaining
+	// validity, whichever is shorter.
 	//
-	// The cache lives in one process. Revoking a password clears it here
-	// immediately, but another replica holding its own entry keeps accepting
-	// that password until the entry lapses -- so this value is also the bound
-	// on how long a revocation takes to reach every replica, which is why it
-	// stays short rather than being tuned up for the bcrypt saving.
+	// The cache lives in one process, and replicas cannot clear each other's
+	// entries, so a hit is never trusted on its own: every hit re-reads the
+	// app_passwords row by primary key (StillValid), and a revocation, expiry
+	// or email change made anywhere is refused on the next request everywhere.
+	// The TTL therefore bounds only how long one bcrypt result is reused and
+	// how stale the cached user's profile fields and last_used_at can get.
 	authCacheTTL = 60 * time.Second
 
 	// lastUsedThrottle is the minimum age of last_used_at before we issue
@@ -30,6 +31,7 @@ const (
 type authCacheEntry struct {
 	user      *store.User
 	tokenID   int64
+	tokenHash string
 	expiresAt time.Time
 }
 
@@ -40,29 +42,37 @@ func authCacheKey(username, password string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Service) authCacheGet(key string) (*store.User, bool) {
+// authCacheGet returns the bcrypt match cached under key. The caller must still
+// confirm the entry's row with StillValid before trusting it.
+func (s *Service) authCacheGet(key string) (authCacheEntry, bool) {
 	s.authMu.Lock()
 	defer s.authMu.Unlock()
 	entry, ok := s.authCache[key]
 	if !ok {
-		return nil, false
+		return authCacheEntry{}, false
 	}
 	if time.Now().After(entry.expiresAt) {
 		delete(s.authCache, key)
-		return nil, false
+		return authCacheEntry{}, false
 	}
-	return entry.user, true
+	return entry, true
+}
+
+func (s *Service) authCacheDelete(key string) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	delete(s.authCache, key)
 }
 
 // authCachePut caches a validated credential until authCacheTTL from now or
-// until the password's own expiry, whichever comes first. A cache hit answers
-// without reading the database, so an entry outliving the password it stands
-// for is the password still working after it expired.
-func (s *Service) authCachePut(key string, user *store.User, tokenID int64, passwordExpiresAt *time.Time) {
+// until the password's own expiry, whichever comes first. The row check on
+// each hit enforces expiry too; the cap keeps an entry from outliving the
+// credential it stands for.
+func (s *Service) authCachePut(key string, user *store.User, token store.AppPassword) {
 	now := time.Now()
 	expiresAt := now.Add(authCacheTTL)
-	if passwordExpiresAt != nil && passwordExpiresAt.Before(expiresAt) {
-		expiresAt = *passwordExpiresAt
+	if token.ExpiresAt != nil && token.ExpiresAt.Before(expiresAt) {
+		expiresAt = *token.ExpiresAt
 	}
 	if !expiresAt.After(now) {
 		// Nothing left to cache; the next request has to consult the database
@@ -81,13 +91,13 @@ func (s *Service) authCachePut(key string, user *store.User, tokenID int64, pass
 			delete(s.authCache, k)
 		}
 	}
-	s.authCache[key] = authCacheEntry{user: user, tokenID: tokenID, expiresAt: expiresAt}
+	s.authCache[key] = authCacheEntry{user: user, tokenID: token.ID, tokenHash: token.TokenHash, expiresAt: expiresAt}
 }
 
-// InvalidateAppPassword drops the cached credential for one app password, so a
-// revocation takes effect on this instance at once rather than at the end of
-// the entry's lifetime. Other replicas hold their own caches and cannot be
-// reached from here; theirs lapse within authCacheTTL.
+// InvalidateAppPassword drops the cached credential for one app password, so
+// the next request on this instance skips straight to full validation. Other
+// replicas keep their entries, but the row check on their next hit refuses the
+// revoked password there too.
 func (s *Service) InvalidateAppPassword(tokenID int64) {
 	if s == nil {
 		return

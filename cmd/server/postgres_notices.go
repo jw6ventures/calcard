@@ -13,8 +13,9 @@ import (
 )
 
 // postgresDriverName is lib/pq with every notice the server sends passed on to
-// CalCard's log. The v1.2.0 upgrade reports what its repairs changed and left
-// as WARNINGs, which PostgreSQL otherwise records only in its own log.
+// CalCard's log, and with connections cut when the server stops answering (see
+// postgresConnector). The v1.2.0 upgrade reports what its repairs changed and
+// left as WARNINGs, which PostgreSQL otherwise records only in its own log.
 const postgresDriverName = "calcard-postgres"
 
 type noticeLogger interface {
@@ -46,11 +47,11 @@ func (d noticeRelayDriver) Open(name string) (driver.Conn, error) {
 }
 
 func (noticeRelayDriver) OpenConnector(name string) (driver.Connector, error) {
-	connector, err := pq.NewConnector(name)
+	cfg, err := pq.NewConfig(name)
 	if err != nil {
 		return nil, err
 	}
-	return pq.ConnectorWithNoticeHandler(connector, logPostgresNotice), nil
+	return postgresConnector{cfg: cfg}, nil
 }
 
 // logPostgresNotice writes a warning at Warn and anything milder at Debug: a

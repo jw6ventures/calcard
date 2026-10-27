@@ -561,10 +561,17 @@ func (s *Service) updateWrite(ctx context.Context, user *store.User, book *store
 		return store.ContactObjectWrite{}, err
 	}
 	if err := s.requireBookPrivilege(ctx, user, book, resourceName, "write-content"); err != nil {
-		if errors.Is(err, ErrForbidden) && s.requireBookPrivilege(ctx, user, book, resourceName, "read") != nil {
-			return store.ContactObjectWrite{}, s.missingContactUpdate(ctx, user, book)
+		if !errors.Is(err, ErrForbidden) {
+			return store.ContactObjectWrite{}, err
 		}
-		return store.ContactObjectWrite{}, err
+		readErr := s.requireBookPrivilege(ctx, user, book, resourceName, "read")
+		if readErr == nil {
+			return store.ContactObjectWrite{}, err
+		}
+		if !errors.Is(readErr, ErrForbidden) && !errors.Is(readErr, ErrNotFound) {
+			return store.ContactObjectWrite{}, readErr
+		}
+		return store.ContactObjectWrite{}, s.missingContactUpdate(ctx, user, book)
 	}
 	statePath := addressBookACLResourcePaths(book.ID, resourceName)[0]
 	lockPreconditions := []store.LockPrecondition{store.NewLockPrecondition(statePath)}

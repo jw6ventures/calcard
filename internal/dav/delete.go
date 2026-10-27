@@ -151,12 +151,12 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "ambiguous calendar path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	} else if matched {
 		aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 		if err != nil {
-			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate ACL")
 			return
 		}
 		refusal, answerAsAbsent, err := h.calendarMemberRemoval(r.Context(), user, calendarID, cleanPath, func() (bool, error) {
@@ -164,7 +164,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			return event != nil, err
 		})
 		if err != nil {
-			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate ACL")
 			return
 		}
 		if refusal != nil {
@@ -175,7 +175,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		if !answerAsAbsent {
 			existing, err = h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
 			if err != nil {
-				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load event")
 				return
 			}
 		}
@@ -195,7 +195,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		}
 		canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 		if err != nil {
-			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve resource state")
 			return
 		}
 		lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
@@ -220,7 +220,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 				return
 			}
 			h.logger().Error("Delete", "failed to delete event %q from calendar %d: %v", existing.UID, calendarID, err)
-			http.Error(w, "failed to delete", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to delete")
 			return
 		}
 		h.logger().Info("Delete", "deleted event %q from calendar %d", existing.UID, calendarID)
@@ -236,31 +236,31 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "ambiguous address book path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address book")
 		return
 	} else if matched {
 		aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 		if err != nil {
-			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate ACL")
 			return
 		}
 		book, err := h.getAddressBook(r.Context(), addressBookID)
 		if err != nil {
-			status := http.StatusInternalServerError
+			status := serverFailureStatus(err)
 			if errors.Is(err, store.ErrNotFound) {
 				status = http.StatusNotFound
 			}
-			http.Error(w, http.StatusText(status), status)
+			writeStatusText(w, status)
 			return
 		}
 		existing, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load contact")
 			return
 		}
 		refusal, answerAsAbsent, err := h.addressBookMemberRemoval(r.Context(), user, book, cleanPath, func() (bool, error) { return existing != nil, nil })
 		if err != nil {
-			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate ACL")
 			return
 		}
 		if refusal != nil {
@@ -284,7 +284,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		}
 		canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 		if err != nil {
-			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve resource state")
 			return
 		}
 		lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
@@ -309,7 +309,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 				return
 			}
 			h.logger().Error("Delete", "failed to delete contact %q from address book %d: %v", existing.UID, addressBookID, err)
-			http.Error(w, "failed to delete", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to delete")
 			return
 		}
 		h.logger().Info("Delete", "deleted contact %q from address book %d", existing.UID, addressBookID)
@@ -327,7 +327,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "failed to resolve calendar", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve calendar")
 			return
 		}
 		http.Error(w, "calendar not found", http.StatusNotFound)
@@ -349,7 +349,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 	source := &store.CalendarAccess{Calendar: *sourceCalendar}
 	events, err := h.store.Events.ListForCalendar(r.Context(), source.ID)
 	if err != nil {
-		http.Error(w, "failed to load calendar members", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar members")
 		return
 	}
 	members := make([]store.CalendarCollectionMember, 0, len(events))
@@ -384,6 +384,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 		SourceStatePath:    calendarStatePath(source.ID),
 		Members:            members,
 		LockPreconditions:  lockPreconditions,
+		RevalidateMembers:  store.RemovedCalendarCollectionMembers,
 	})
 	if err != nil {
 		switch {
@@ -394,7 +395,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 		case errors.Is(err, store.ErrNotFound):
 			http.Error(w, "calendar not found", http.StatusNotFound)
 		default:
-			http.Error(w, "failed to delete calendar collection", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to delete calendar collection")
 		}
 		return
 	}

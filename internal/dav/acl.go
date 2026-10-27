@@ -38,7 +38,7 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to resolve path", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve path")
 		return
 	}
 	if isProtectedVirtualDAVRoot(canonicalPath) {
@@ -50,14 +50,14 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 		} else {
-			http.Error(w, "failed to resolve resource", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve resource")
 		}
 		return
 	}
 
 	allowed, err := h.checkACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "write-acl")
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	if !allowed {
@@ -97,7 +97,7 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 	var entries []store.ACLEntry
 	ownerPrincipal, err := h.ownerPrincipalForPath(r.Context(), user, canonicalPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource owner", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource owner")
 		return
 	}
 	for acePosition, a := range req.ACE {
@@ -119,7 +119,7 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 		}
 		principalHref, condition, err := h.resolveACLPrincipal(r, a.Principal[0])
 		if err != nil {
-			http.Error(w, "failed to resolve principal", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve principal")
 			return
 		}
 		if condition != "" {
@@ -188,7 +188,7 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
-		http.Error(w, "failed to set ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to set ACL")
 		return
 	}
 	invalidateDAVRequestState(r.Context())
@@ -499,8 +499,8 @@ func (h *DavServer) checkACLPrivilege(ctx context.Context, user *store.User, res
 	}
 
 	// Owners hold every privilege whatever the ACL says.
-	if h.isResourceOwner(ctx, user, resourcePath) {
-		return true, nil
+	if owner, err := h.isResourceOwner(ctx, user, resourcePath); err != nil || owner {
+		return owner, err
 	}
 
 	if granted, applicable, err := h.aclDecision(ctx, user, resourcePath, privilege); err != nil {
@@ -672,7 +672,11 @@ func (h *DavServer) aclGuard(ctx context.Context, user *store.User, resourcePath
 			canonicalPath = resourcePath
 		}
 		canonicalPaths = append(canonicalPaths, canonicalPath)
-		if !h.isResourceOwner(ctx, user, canonicalPath) {
+		owner, err := h.isResourceOwner(ctx, user, canonicalPath)
+		if err != nil {
+			return nil, err
+		}
+		if !owner {
 			ownsAll = false
 		}
 	}
@@ -712,59 +716,77 @@ func isProtectedVirtualDAVRoot(resourcePath string) bool {
 	}
 }
 
-func (h *DavServer) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) bool {
+// isResourceOwner reports whether user owns the resource at resourcePath. A
+// collection that is missing or ambiguous has no owner to match; any other
+// failure to read it is returned, since an outage must not read as a refusal.
+func (h *DavServer) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
 	if h == nil || h.store == nil || user == nil {
-		return false
+		return false, nil
 	}
 	cleanPath := path.Clean(resourcePath)
 	if cleanPath == "/dav" || cleanPath == "/dav/calendars" || cleanPath == "/dav/addressbooks" || cleanPath == "/dav/principals" {
-		return true
+		return true, nil
 	}
 
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/calendars/"), "/")
 		if trimmed == "" {
-			return false
+			return false, nil
 		}
 		segment := strings.Split(trimmed, "/")[0]
 		calID, ok, err := h.resolveCalendarID(ctx, user, segment)
-		if err == nil && ok {
-			if cal, err := h.getCalendar(ctx, calID); err == nil {
-				return cal.UserID == user.ID
-			}
+		if err != nil || !ok {
+			return false, collectionLookupFailure(err)
 		}
-		return false
+		cal, err := h.getCalendar(ctx, calID)
+		if err != nil {
+			return false, collectionLookupFailure(err)
+		}
+		return cal.UserID == user.ID, nil
 	}
 
 	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks/"), "/")
 		if trimmed == "" {
-			return false
+			return false, nil
 		}
 		segment := strings.Split(trimmed, "/")[0]
 		bookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
-		if err == nil && ok {
-			if book, err := h.getAddressBook(ctx, bookID); err == nil {
-				return book.UserID == user.ID
-			}
+		if err != nil || !ok {
+			return false, collectionLookupFailure(err)
 		}
-		return false
+		book, err := h.getAddressBook(ctx, bookID)
+		if err != nil {
+			return false, collectionLookupFailure(err)
+		}
+		return book.UserID == user.ID, nil
 	}
 
 	if strings.HasPrefix(cleanPath, "/dav/principals/") {
 		trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/")
 		if trimmed == "" {
-			return false
+			return false, nil
 		}
 		segment := strings.Split(trimmed, "/")[0]
 		principalID, err := strconv.ParseInt(segment, 10, 64)
 		if err != nil {
-			return false
+			return false, nil
 		}
-		return principalID == user.ID
+		return principalID == user.ID, nil
 	}
 
-	return false
+	return false, nil
+}
+
+// collectionLookupFailure is what a lookup that resolved a collection only to
+// inspect it returns for err: nothing for a collection that is missing or
+// ambiguous, which the request answers on its own, and err for any other
+// failure, so a store outage is not mistaken for an absent collection.
+func collectionLookupFailure(err error) error {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
+		return nil
+	}
+	return err
 }
 
 // PROPFIND ACL property helpers

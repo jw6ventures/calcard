@@ -96,6 +96,11 @@ type AppPasswordRepository interface {
 	FindValidByUser(ctx context.Context, userID int64) ([]AppPassword, error)
 	ListByUser(ctx context.Context, userID int64) ([]AppPassword, error)
 	GetByID(ctx context.Context, id int64) (*AppPassword, error)
+	// StillValid reports whether app password id still authenticates the user
+	// userID signing in as email with the password tokenHash was issued for:
+	// the row exists unrevoked and unexpired, it still holds tokenHash, and the
+	// user's primary email is still email.
+	StillValid(ctx context.Context, id, userID int64, email, tokenHash string) (bool, error)
 	Revoke(ctx context.Context, id int64) error
 	DeleteRevoked(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error

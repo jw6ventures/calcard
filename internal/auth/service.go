@@ -142,18 +142,20 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.Users.UpsertOAuthUser(ctx, identity.Subject, identity.Email, identity.FullName, identity.FirstName)
 	if err != nil {
 		s.logger().Error("oauth_callback", "failed to persist user for subject %q: %v", identity.Subject, err)
-		http.Error(w, "failed to persist user", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to persist user")
 		return
 	}
 	s.authCacheClearUser(user.ID)
 
 	if err := s.store.EnsureDefaultCollections(ctx, user.ID); err != nil {
-		http.Error(w, "failed to bootstrap user", http.StatusInternalServerError)
+		s.logger().Error("oauth_callback", "failed to bootstrap user %d: %v", user.ID, err)
+		writeServerFailure(w, err, "failed to bootstrap user")
 		return
 	}
 
 	if err := s.sessions.Issue(ctx, w, r, user.ID); err != nil {
-		http.Error(w, "failed to set session", http.StatusInternalServerError)
+		s.logger().Error("oauth_callback", "failed to issue a session for user %d: %v", user.ID, err)
+		writeServerFailure(w, err, "failed to set session")
 		return
 	}
 
@@ -208,10 +210,19 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
 	// Fast path: DAV clients re-send Basic credentials on every request, so a
 	// short-lived cache lets us skip the GetByEmail/FindValidByUser reads and,
-	// crucially, the per-request bcrypt comparison (the dominant CPU cost).
+	// crucially, the per-request bcrypt comparison (the dominant CPU cost). A
+	// hit is confirmed against the shared row, because a revocation served by
+	// another replica cannot clear this process's cache.
 	cacheKey := authCacheKey(username, password)
-	if user, ok := s.authCacheGet(cacheKey); ok {
-		return user, nil
+	if entry, ok := s.authCacheGet(cacheKey); ok {
+		valid, err := s.store.AppPasswords.StillValid(ctx, entry.tokenID, entry.user.ID, username, entry.tokenHash)
+		if err != nil {
+			return nil, credentialLookupError(err)
+		}
+		if valid {
+			return entry.user, nil
+		}
+		s.authCacheDelete(cacheKey)
 	}
 
 	user, err := s.store.Users.GetByEmail(ctx, username)
@@ -237,7 +248,7 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
 			s.backfillDigestCredentials(ctx, user, t, password)
 			s.touchLastUsedThrottled(t)
-			s.authCachePut(cacheKey, user, t.ID, t.ExpiresAt)
+			s.authCachePut(cacheKey, user, t)
 			return user, nil
 		}
 	}
@@ -309,13 +320,24 @@ func (s *Service) replaceDigestCredentials(ctx context.Context, token store.AppP
 func (s *Service) RequireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		uid, sessionID, ok := s.sessions.CurrentUserID(ctx, r)
+		// A session that could not be read is not a logged-out one: the
+		// visitor keeps the cookie and is answered 503 or 500 rather than
+		// sent to log in again over what may be a database outage.
+		uid, sessionID, ok, err := s.sessions.CurrentUserID(ctx, r)
+		if err != nil {
+			s.writeCredentialLookupFailure(w, r, err)
+			return
+		}
 		if !ok {
 			http.Redirect(w, r, "/auth/login", http.StatusFound)
 			return
 		}
 		user, err := s.store.Users.GetByID(ctx, uid)
-		if err != nil || user == nil {
+		if err != nil {
+			s.writeCredentialLookupFailure(w, r, err)
+			return
+		}
+		if user == nil {
 			s.sessions.Clear(ctx, w, r)
 			http.Redirect(w, r, "/auth/login", http.StatusFound)
 			return
@@ -404,6 +426,18 @@ func (s *Service) writeCredentialLookupFailure(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Retry-After", davRetryAfterSeconds)
 	}
 	http.Error(w, http.StatusText(status), status)
+}
+
+// writeServerFailure answers a request that failed with err for a reason of
+// the server's own: 503 with Retry-After and the status text alone while the
+// store is unavailable, and 500 with message otherwise.
+func writeServerFailure(w http.ResponseWriter, err error, message string) {
+	if store.IsUnavailable(err) {
+		w.Header().Set("Retry-After", davRetryAfterSeconds)
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, message, http.StatusInternalServerError)
 }
 
 func (s *Service) ClearSession(w http.ResponseWriter, r *http.Request) {

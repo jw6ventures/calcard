@@ -26,6 +26,12 @@ data:
   {{- if hasKey . "connMaxLifetime" }}
   APP_DB_CONN_MAX_LIFETIME: {{ .connMaxLifetime | quote }}
   {{- end }}
+  {{- if hasKey . "connectTimeout" }}
+  {{- if not (regexMatch "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" (toString .connectTimeout)) }}
+  {{- fail (printf "app.db.connectTimeout must be a Go duration such as 5s, or 0, got %v" .connectTimeout) }}
+  {{- end }}
+  APP_DB_CONNECT_TIMEOUT: {{ .connectTimeout | quote }}
+  {{- end }}
   {{- end }}
   {{- with .Values.app.http }}
   {{- if hasKey . "readTimeout" }}
@@ -40,6 +46,20 @@ data:
   {{- end }}
   {{- if hasKey .Values.app "trafficCaptureFile" }}
   APP_TRAFFIC_CAPTURE_FILE: {{ .Values.app.trafficCaptureFile | quote }}
+  {{- end }}
+  {{- with .Values.app.rateLimit }}
+  {{- if hasKey . "authRps" }}
+  APP_RATE_LIMIT_AUTH_RPS: {{ include "calcard.rate" (list "app.rateLimit.authRps" .authRps) | quote }}
+  {{- end }}
+  {{- if hasKey . "authBurst" }}
+  APP_RATE_LIMIT_AUTH_BURST: {{ include "calcard.integer" (list "app.rateLimit.authBurst" .authBurst 1) | quote }}
+  {{- end }}
+  {{- if hasKey . "davRps" }}
+  APP_RATE_LIMIT_DAV_RPS: {{ include "calcard.rate" (list "app.rateLimit.davRps" .davRps) | quote }}
+  {{- end }}
+  {{- if hasKey . "davBurst" }}
+  APP_RATE_LIMIT_DAV_BURST: {{ include "calcard.integer" (list "app.rateLimit.davBurst" .davBurst 1) | quote }}
+  {{- end }}
   {{- end }}
   APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}

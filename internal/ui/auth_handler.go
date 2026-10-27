@@ -17,7 +17,7 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 
 	sessions, err := h.store.Sessions.ListByUser(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load sessions", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load sessions")
 		return
 	}
 
@@ -92,7 +92,7 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 	// Verify session belongs to user
 	session, err := h.store.Sessions.GetByID(r.Context(), sessionID)
 	if err != nil {
-		http.Error(w, "failed to load session", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load session")
 		return
 	}
 	if session == nil || session.UserID != user.ID {
@@ -101,7 +101,7 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Sessions.Delete(r.Context(), sessionID); err != nil {
-		http.Error(w, "failed to revoke session", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to revoke session")
 		return
 	}
 
@@ -116,14 +116,18 @@ func (h *Handler) RevokeAllSessions(w http.ResponseWriter, r *http.Request) {
 	// Get all sessions for user
 	sessions, err := h.store.Sessions.ListByUser(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load sessions", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load sessions")
 		return
 	}
 
 	// Delete all except current
 	for _, s := range sessions {
-		if s.ID != currentSessionID {
-			_ = h.store.Sessions.Delete(r.Context(), s.ID)
+		if s.ID == currentSessionID {
+			continue
+		}
+		if err := h.store.Sessions.Delete(r.Context(), s.ID); err != nil {
+			writeServerFailure(w, err, "failed to revoke sessions")
+			return
 		}
 	}
 
@@ -166,7 +170,7 @@ func (h *Handler) CreateAppPassword(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	token, _, err := h.authService.CreateAppPassword(r.Context(), user.ID, label, expiresAt)
 	if err != nil {
-		http.Error(w, "create failed", http.StatusInternalServerError)
+		writeServerFailure(w, err, "create failed")
 		return
 	}
 
@@ -186,7 +190,7 @@ func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.store.AppPasswords.GetByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "failed to load app password", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load app password")
 		return
 	}
 	if token == nil || token.UserID != user.ID {
@@ -195,12 +199,12 @@ func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if token.RevokedAt == nil {
 		if err := h.store.AppPasswords.Revoke(r.Context(), id); err != nil {
-			http.Error(w, "failed to revoke app password", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to revoke app password")
 			return
 		}
 	}
-	// A cached credential is served without reading the database, so the
-	// revocation only takes effect once the cache has been told about it.
+	// Every instance re-reads the row on a cache hit, so the revocation already
+	// holds everywhere; dropping the local entry spares this instance that read.
 	h.authService.InvalidateAppPassword(id)
 
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
@@ -219,7 +223,7 @@ func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.store.AppPasswords.GetByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "failed to load app password", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load app password")
 		return
 	}
 	if token == nil || token.UserID != user.ID {
@@ -232,7 +236,7 @@ func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.AppPasswords.DeleteRevoked(r.Context(), id); err != nil {
-		http.Error(w, "failed to delete app password", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to delete app password")
 		return
 	}
 	h.authService.InvalidateAppPassword(id)
@@ -244,7 +248,7 @@ func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, user *store.User, plaintext string) {
 	passwords, err := h.store.AppPasswords.ListByUser(r.Context(), user.ID)
 	if err != nil {
-		http.Error(w, "failed to load app passwords", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load app passwords")
 		return
 	}
 
@@ -311,7 +315,7 @@ func (h *Handler) CompleteOnboarding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.Users.MarkOnboardingComplete(r.Context(), user.ID); err != nil {
-		http.Error(w, "failed to record onboarding", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to record onboarding")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

@@ -1854,6 +1854,23 @@ func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, 
 	return &t, nil
 }
 
+func (r *appPasswordRepo) StillValid(ctx context.Context, id, userID int64, email, tokenHash string) (bool, error) {
+	const q = `
+SELECT EXISTS (
+    SELECT 1
+    FROM app_passwords t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.id=$1 AND t.user_id=$2 AND u.primary_email=$3 AND t.token_hash=$4
+      AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
+)`
+	defer observeDB(ctx, "app_passwords.still_valid")()
+	var valid bool
+	if err := r.pool.QueryRowContext(ctx, q, id, userID, email, tokenHash).Scan(&valid); err != nil {
+		return false, err
+	}
+	return valid, nil
+}
+
 func (r *appPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET revoked_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.revoke")()

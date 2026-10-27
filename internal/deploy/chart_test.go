@@ -650,7 +650,8 @@ func withoutYAMLComments(document string) string {
 }
 
 // chartIntegerValues is every integer the chart renders from a value, with the
-// smallest each accepts. The DAV limits take 0 to turn the limit off. A port is
+// smallest each accepts. The DAV limits take 0 to turn the limit off; a rate
+// limit burst must admit at least one request. A port is
 // also bounded above, and its schema accepts a string of digits as well as an
 // integer, because 1.1.x had no schema and so accepted a quoted port.
 var chartIntegerValues = []struct {
@@ -670,6 +671,8 @@ var chartIntegerValues = []struct {
 	{"app.dav.maxRequestedProperties", 0, false},
 	{"app.dav.maxMultigetHrefs", 0, false},
 	{"app.dav.maxReportCandidateRows", 0, false},
+	{"app.rateLimit.authBurst", 1, false},
+	{"app.rateLimit.davBurst", 1, false},
 	{"service.port", 1, true},
 	{"startupProbe.periodSeconds", 1, false},
 	{"startupProbe.failureThreshold", 1, false},
@@ -751,6 +754,11 @@ func TestHelmChartRendersValuesFileIntegersAsDecimal(t *testing.T) {
     maxRequestedProperties: 67108864
     maxMultigetHrefs: 67108864
     maxReportCandidateRows: 67108864
+  rateLimit:
+    authRps: 67108864
+    authBurst: 67108864
+    davRps: 67108864
+    davBurst: 67108864
 service:
   port: 65535
 startupProbe:
@@ -772,6 +780,10 @@ startupProbe:
 		`APP_DAV_MAX_REQUESTED_PROPERTIES: "67108864"`,
 		`APP_DAV_MAX_MULTIGET_HREFS: "67108864"`,
 		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "67108864"`,
+		`APP_RATE_LIMIT_AUTH_RPS: "67108864"`,
+		`APP_RATE_LIMIT_AUTH_BURST: "67108864"`,
+		`APP_RATE_LIMIT_DAV_RPS: "67108864"`,
+		`APP_RATE_LIMIT_DAV_BURST: "67108864"`,
 	} {
 		if !hasLine(configmap, want) {
 			t.Errorf("configmap is missing %s:\n%s", want, configmap)
@@ -980,6 +992,120 @@ func TestHelmChartReportTimeoutIsADuration(t *testing.T) {
 		{"--set-string", "app.dav.reportTimeout=ten seconds"},
 		{"--set-string", "app.dav.reportTimeout=-5s"},
 		{"--set-string", "app.dav.reportTimeout="},
+	} {
+		args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+		for _, skip := range []bool{false, true} {
+			run := append(append([]string{}, args...), bad...)
+			if skip {
+				run = append(run, "--skip-schema-validation")
+			}
+			if output, err := runHelm(t, run...); err == nil {
+				t.Errorf("helm rendered %v (skip schema %t) although the server refuses it at startup:\n%.300s", bad, skip, output)
+			}
+		}
+	}
+}
+
+// The rate limits are per replica, and an operator dividing a fleet-wide rate
+// across replicas needs a fractional rate, which --set passes as a string and a
+// values file as a number. Left unset, no key reaches the server, which then
+// applies its own defaults.
+func TestHelmChartRateLimitsReachTheConfigMap(t *testing.T) {
+	if configmap := requireDocument(t, renderChart(t), "configmap.yaml"); strings.Contains(configmap, "APP_RATE_LIMIT_") {
+		t.Errorf("an unset rate limit reached the server:\n%s", configmap)
+	}
+
+	valuesFile := writeValuesFile(t, "rate-limits.yaml", `app:
+  rateLimit:
+    authRps: 1.25
+    davRps: 20
+`)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "set",
+			args: []string{
+				"--set", "app.rateLimit.authRps=2.5",
+				"--set", "app.rateLimit.authBurst=4",
+				"--set", "app.rateLimit.davRps=7",
+				"--set", "app.rateLimit.davBurst=35",
+			},
+			want: []string{
+				`APP_RATE_LIMIT_AUTH_RPS: "2.5"`,
+				`APP_RATE_LIMIT_AUTH_BURST: "4"`,
+				`APP_RATE_LIMIT_DAV_RPS: "7"`,
+				`APP_RATE_LIMIT_DAV_BURST: "35"`,
+			},
+		},
+		{
+			name: "values file",
+			args: []string{"-f", valuesFile},
+			want: []string{`APP_RATE_LIMIT_AUTH_RPS: "1.25"`, `APP_RATE_LIMIT_DAV_RPS: "20"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configmap := requireDocument(t, renderChart(t, tc.args...), "configmap.yaml")
+			for _, want := range tc.want {
+				if !hasLine(configmap, want) {
+					t.Errorf("configmap is missing %s:\n%s", want, configmap)
+				}
+			}
+		})
+	}
+}
+
+// A rate of 0 turns the limiter off, so the chart renders it; the server
+// refuses a negative or unparsable rate at startup, so the chart refuses one at
+// render: the schema first, and the template again for installs run with
+// --skip-schema-validation.
+func TestHelmChartRefusesANegativeRateLimit(t *testing.T) {
+	for _, key := range []string{"app.rateLimit.authRps", "app.rateLimit.davRps"} {
+		for _, zero := range [][]string{{"--set", key + "=0"}, {"--set-string", key + "=0.0"}} {
+			configmap := requireDocument(t, renderChart(t, zero...), "configmap.yaml")
+			env := "APP_RATE_LIMIT_" + strings.ToUpper(strings.TrimSuffix(strings.TrimPrefix(key, "app.rateLimit."), "Rps")) + "_RPS"
+			if !hasLine(configmap, env+`: "0"`) && !hasLine(configmap, env+`: "0.0"`) {
+				t.Errorf("rate 0 (%v) did not reach the configmap:\n%s", zero, configmap)
+			}
+		}
+		for _, bad := range [][]string{
+			{"--set", key + "=-1"},
+			{"--set-string", key + "=fast"},
+			{"--set-string", key + "="},
+			{"-f", writeValuesFile(t, "negative.yaml", nestedValuesYAML(key, "-0.5"))},
+		} {
+			for _, skip := range []bool{false, true} {
+				args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+				args = append(args, bad...)
+				if skip {
+					args = append(args, "--skip-schema-validation")
+				}
+				if output, err := runHelm(t, args...); err == nil {
+					t.Errorf("helm rendered %v (skip schema %t) although the server refuses it at startup:\n%.300s", bad, skip, output)
+				}
+			}
+		}
+	}
+}
+
+// The server reads APP_DB_CONNECT_TIMEOUT as a Go duration, so the chart
+// refuses a bare number other than 0 at render, as it does for reportTimeout.
+func TestHelmChartConnectTimeoutIsADuration(t *testing.T) {
+	if configmap := requireDocument(t, renderChart(t), "configmap.yaml"); !hasLine(configmap, `APP_DB_CONNECT_TIMEOUT: "5s"`) {
+		t.Errorf("configmap does not carry the default connectTimeout:\n%s", configmap)
+	}
+	for _, set := range []string{"--set", "--set-string"} {
+		documents := renderChart(t, set, "app.db.connectTimeout=0")
+		if configmap := requireDocument(t, documents, "configmap.yaml"); !hasLine(configmap, `APP_DB_CONNECT_TIMEOUT: "0"`) {
+			t.Errorf("connectTimeout 0 (%s) did not render:\n%s", set, configmap)
+		}
+	}
+	for _, bad := range [][]string{
+		{"--set", "app.db.connectTimeout=5"},
+		{"--set-string", "app.db.connectTimeout=5"},
+		{"--set-string", "app.db.connectTimeout=-5s"},
 	} {
 		args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
 		for _, skip := range []bool{false, true} {

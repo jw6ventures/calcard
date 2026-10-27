@@ -122,6 +122,9 @@ func writeResponseError(w http.ResponseWriter, err error) bool {
 		http.Error(w, body, status)
 		return true
 	}
+	if writeStoreUnavailable(w, err) {
+		return true
+	}
 	http.Error(w, err.Error(), http.StatusBadRequest)
 	return true
 }

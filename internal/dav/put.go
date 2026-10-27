@@ -110,7 +110,7 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous calendar path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	} else if matched {
 		h.putCalendarObject(w, r, user, calendarID, resourceUID, cleanPath)
@@ -126,7 +126,7 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous address book path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load address book")
 		return
 	} else if matched {
 		h.putContact(w, r, user, addressBookID, resourceName, cleanPath)
@@ -172,7 +172,7 @@ func readPutBody(w http.ResponseWriter, r *http.Request, domain davPathDomain) (
 func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string) {
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	cal, existingByResource, ok := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
@@ -272,7 +272,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		invalidateDAVRequestState(r.Context())
 		currentACL, aclErr := h.aclGuard(r.Context(), user, cleanPath)
 		if aclErr != nil {
-			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			writeServerFailure(w, aclErr, "failed to evaluate ACL")
 			return
 		}
 		currentCal, current, authorized := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
@@ -304,7 +304,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		}
 		if conflict == nil {
 			h.logger().Error("Put", "calendar object UID conflict did not identify a resource for %q in calendar %d", uid, calendarID)
-			http.Error(w, "failed to save event", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to save event")
 			return
 		}
 		writeCalDAVUIDConflict(w, calendarObjectConflictHref(calendarID, conflict))
@@ -317,18 +317,18 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	case errors.Is(err, store.ErrConflict):
 		h.logger().Error("Put", "calendar object store conflict did not identify a resource for %q in calendar %d", uid, calendarID)
-		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to save event")
 		return
 	case errors.Is(err, store.ErrResourceStateChanged):
 		http.Error(w, "resource changed while writing; retry the request", http.StatusConflict)
 		return
 	case err != nil:
 		h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
-		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to save event")
 		return
 	case result == nil:
 		h.logger().Error("Put", "calendar object write returned no result for %q in calendar %d", uid, calendarID)
-		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to save event")
 		return
 	}
 
@@ -383,7 +383,7 @@ func addressObjectConflictHref(addressBookID int64, resourceName string) string 
 func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceName, cleanPath string) (*store.CalendarAccess, *store.Event, bool) {
 	existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
 	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load event")
 		return nil, nil, false
 	}
 	requiredPrivilege := "bind"
@@ -492,21 +492,21 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 func (h *DavServer) authorizeContactObjectTarget(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, resourceName, cleanPath string) (*store.ACLGuard, *store.Contact, bool) {
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return nil, nil, false
 	}
 	book, err := h.getAddressBook(r.Context(), addressBookID)
 	if err != nil {
-		status := http.StatusInternalServerError
 		if errors.Is(err, store.ErrNotFound) {
-			status = http.StatusNotFound
+			http.Error(w, "address book not found", http.StatusNotFound)
+			return nil, nil, false
 		}
-		http.Error(w, "address book not found", status)
+		writeServerFailure(w, err, "failed to load address book")
 		return nil, nil, false
 	}
 	existing, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
-		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load contact")
 		return nil, nil, false
 	}
 	requiredPrivilege := "bind"
@@ -545,7 +545,7 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 
 	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), req.addressBookID, req.uid)
 	if err != nil {
-		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load contact")
 		return
 	}
 	if existingByUID != nil && contactResourceName(*existingByUID) != req.resourceName {
@@ -578,7 +578,7 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 
 	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, req.cleanPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource state")
 		return
 	}
 	expectedState := store.ContactDAVResourceState(existingByName)
@@ -601,7 +601,7 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 	switch {
 	case errors.Is(err, store.ErrUIDConflict):
 		if result == nil || result.Conflict == nil {
-			http.Error(w, "failed to save contact", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to save contact")
 			return
 		}
 		writeCardDAVUIDConflict(w, addressObjectConflictHref(req.addressBookID, contactResourceName(*result.Conflict)))
@@ -629,7 +629,7 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		return
 	case err != nil:
 		h.logger().Error("Put", "failed to save contact %q in address book %d: %v", req.uid, req.addressBookID, err)
-		http.Error(w, "failed to save contact", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to save contact")
 		return
 	}
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", req.etag))

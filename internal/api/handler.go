@@ -102,7 +102,7 @@ func (h *Handler) ListCalendars(w http.ResponseWriter, r *http.Request) {
 	}
 	cals, err := h.events.ListCalendars(r.Context(), user)
 	if err != nil {
-		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to load calendars")
 		return
 	}
 	resp := make([]calendarResponse, 0, len(cals))
@@ -445,7 +445,7 @@ func toEventResponse(ev store.Event) eventResponse {
 func writeEventError(w http.ResponseWriter, err error) {
 	status := events.StatusCode(err)
 	if status == http.StatusInternalServerError {
-		http.Error(w, "internal server error", status)
+		writeServerFailure(w, err, "internal server error")
 		return
 	}
 	http.Error(w, err.Error(), status)

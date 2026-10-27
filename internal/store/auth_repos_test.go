@@ -79,6 +79,17 @@ ORDER BY created_at DESC
 		t.Fatalf("GetByID() = %#v, want nil", got)
 	}
 
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs(int64(1), int64(7), "laptop@example.com", "hash").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	valid, err := repo.StillValid(context.Background(), 1, 7, "laptop@example.com", "hash")
+	if err != nil {
+		t.Fatalf("StillValid() error = %v", err)
+	}
+	if !valid {
+		t.Fatal("StillValid() = false, want true")
+	}
+
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE app_passwords SET revoked_at = NOW() WHERE id=$1`)).
 		WithArgs(int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -102,6 +113,86 @@ ORDER BY created_at DESC
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// StillValid is what every replica's cache hit asks, so each change that ends a
+// credential -- revocation, expiry, the email moving, the row going -- has to
+// turn it false.
+func TestAppPasswordRepoStillValidTracksTheRowAndTheUsersEmail(t *testing.T) {
+	st := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := st.Users.UpsertOAuthUser(ctx, "subject-still-valid", "still@example.test", "Test User", "Test")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
+	}
+	other, err := st.Users.UpsertOAuthUser(ctx, "subject-other", "other@example.test", "Other User", "Other")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser(other) error = %v", err)
+	}
+	create := func(label string, expiresAt *time.Time) *AppPassword {
+		t.Helper()
+		created, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: label, TokenHash: "hash-" + label, ExpiresAt: expiresAt})
+		if err != nil {
+			t.Fatalf("Create(%s) error = %v", label, err)
+		}
+		return created
+	}
+	future := time.Now().Add(time.Hour)
+	past := time.Now().Add(-time.Second)
+	live := create("live", &future)
+	expired := create("expired", &past)
+	revoked := create("revoked", nil)
+	if err := st.AppPasswords.Revoke(ctx, revoked.ID); err != nil {
+		t.Fatalf("Revoke() error = %v", err)
+	}
+	deleted := create("deleted", nil)
+	if err := st.AppPasswords.Revoke(ctx, deleted.ID); err != nil {
+		t.Fatalf("Revoke(deleted) error = %v", err)
+	}
+	if err := st.AppPasswords.DeleteRevoked(ctx, deleted.ID); err != nil {
+		t.Fatalf("DeleteRevoked() error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		id        int64
+		userID    int64
+		email     string
+		tokenHash string
+		want      bool
+	}{
+		{name: "live", id: live.ID, userID: user.ID, email: user.PrimaryEmail, tokenHash: live.TokenHash, want: true},
+		{name: "different hash", id: live.ID, userID: user.ID, email: user.PrimaryEmail, tokenHash: "hash-other"},
+		{name: "different user", id: live.ID, userID: other.ID, email: other.PrimaryEmail, tokenHash: live.TokenHash},
+		{name: "different email", id: live.ID, userID: user.ID, email: other.PrimaryEmail, tokenHash: live.TokenHash},
+		{name: "expired", id: expired.ID, userID: user.ID, email: user.PrimaryEmail, tokenHash: expired.TokenHash},
+		{name: "revoked", id: revoked.ID, userID: user.ID, email: user.PrimaryEmail, tokenHash: revoked.TokenHash},
+		{name: "deleted", id: deleted.ID, userID: user.ID, email: user.PrimaryEmail, tokenHash: deleted.TokenHash},
+	} {
+		got, err := st.AppPasswords.StillValid(ctx, tc.id, tc.userID, tc.email, tc.tokenHash)
+		if err != nil {
+			t.Fatalf("StillValid(%s) error = %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("StillValid(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// A login that moves the email revokes every app password in the same
+	// statement; the old username must stop authenticating, and the new one
+	// must not inherit the revoked password either.
+	if _, err := st.Users.UpsertOAuthUser(ctx, "subject-still-valid", "moved@example.test", "Test User", "Test"); err != nil {
+		t.Fatalf("UpsertOAuthUser(moved) error = %v", err)
+	}
+	for _, email := range []string{user.PrimaryEmail, "moved@example.test"} {
+		got, err := st.AppPasswords.StillValid(ctx, live.ID, user.ID, email, live.TokenHash)
+		if err != nil {
+			t.Fatalf("StillValid(%s after email change) error = %v", email, err)
+		}
+		if got {
+			t.Fatalf("StillValid(%s after email change) = true", email)
+		}
 	}
 }
 

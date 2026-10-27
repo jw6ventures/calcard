@@ -213,7 +213,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to resolve path", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve path")
 		return
 	}
 	depth, err := parseLockDepth(r.Header.Get("Depth"))
@@ -223,17 +223,17 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	}
 	targetExists, targetState, err := h.lockTargetState(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to resolve lock target", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve lock target")
 		return
 	}
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to authorize lock")
 		return
 	}
 	allowed, err := h.canLockPath(r.Context(), user, cleanPath, targetExists)
 	if err != nil {
-		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to authorize lock")
 		return
 	}
 	if !allowed {
@@ -289,7 +289,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	// such as its collection's when it creates a member.
 	own, err := h.ownLockRootedAt(r, user, canonicalPath)
 	if err != nil {
-		http.Error(w, "failed to resolve lock token", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve lock token")
 		return
 	}
 	if own != nil && own.LockScope == scope {
@@ -327,7 +327,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	expectedExists := targetExists
 	newLock.ExpectedTargetExists = &expectedExists
 	if err := h.populateLockExpectation(r.Context(), user, cleanPath, targetState, &newLock); err != nil {
-		http.Error(w, "failed to resolve lock target state", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve lock target state")
 		return
 	}
 	// RFC 4918 §9.10.4 has a LOCK of an unmapped URL create the resource, which
@@ -360,7 +360,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
-		http.Error(w, "failed to create lock", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to create lock")
 		return
 	}
 	if created.ResourcePath != canonicalPath {
@@ -382,7 +382,7 @@ func (h *DavServer) refreshLock(w http.ResponseWriter, r *http.Request, user *st
 	}
 	existing, err := h.store.Locks.GetByToken(r.Context(), token)
 	if err != nil {
-		http.Error(w, "failed to resolve lock token", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve lock token")
 		return
 	}
 	if existing == nil || existing.ExpiresAt.Before(time.Now()) {
@@ -414,7 +414,7 @@ func (h *DavServer) writeLockRefresh(w http.ResponseWriter, r *http.Request, tok
 		return
 	}
 	if err != nil {
-		http.Error(w, "failed to refresh lock", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to refresh lock")
 		return
 	}
 	writeLockResponse(w, refreshed, http.StatusOK)
@@ -469,10 +469,10 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 	switch target.Domain {
 	case davPathCalendar:
 		calendarID, ok, err := h.resolveCalendarID(ctx, user, target.CollectionSegment)
-		if errors.Is(err, store.ErrNotFound) || !ok {
+		if errors.Is(err, store.ErrNotFound) {
 			return nil
 		}
-		if err != nil || calendarID == birthdayCalendarID {
+		if err != nil || !ok || calendarID == birthdayCalendarID {
 			return err
 		}
 		if _, err := h.getCalendar(ctx, calendarID); err != nil {
@@ -485,10 +485,10 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 		}
 	case davPathAddressBook:
 		addressBookID, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
-		if errors.Is(err, store.ErrNotFound) || !ok {
+		if errors.Is(err, store.ErrNotFound) {
 			return nil
 		}
-		if err != nil {
+		if err != nil || !ok {
 			return err
 		}
 		if _, err := h.getAddressBook(ctx, addressBookID); err != nil {
@@ -795,11 +795,15 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ambiguous path", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to resolve path", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve path")
 		return
 	}
 	lock, err := h.store.Locks.GetByToken(r.Context(), token)
-	if err != nil || lock == nil {
+	if err != nil {
+		writeServerFailure(w, err, "failed to resolve lock token")
+		return
+	}
+	if lock == nil {
 		writeDAVError(w, http.StatusConflict, conditionLockTokenMatchesRequestURI)
 		return
 	}
@@ -827,7 +831,7 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 
 	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.Locks.Delete(r.Context(), token); err != nil {
-		http.Error(w, "failed to unlock", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to unlock")
 		return
 	}
 
@@ -1053,7 +1057,8 @@ func (h *DavServer) lockedPathsBelow(ctx context.Context, collectionPath string)
 
 // writeLockStateError answers a lock check that could not be made: 404 or 409
 // for a target whose collection is missing or ambiguous, as LOCK answers such
-// a path, and 500 for any other failure.
+// a path, and for any other failure 503 while the store is unavailable and
+// 500 otherwise.
 func writeLockStateError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -1061,7 +1066,7 @@ func writeLockStateError(w http.ResponseWriter, err error) {
 	case errors.Is(err, errAmbiguousAddressBook), errors.Is(err, errAmbiguousCalendar):
 		http.Error(w, "ambiguous path", http.StatusConflict)
 	default:
-		http.Error(w, "failed to verify lock state", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to verify lock state")
 	}
 }
 

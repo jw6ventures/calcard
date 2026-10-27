@@ -213,7 +213,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 		} else {
-			http.Error(w, "failed to resolve resource", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve resource")
 		}
 		return
 	}
@@ -222,13 +222,13 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 		} else {
-			http.Error(w, "failed to resolve resource", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve resource")
 		}
 		return
 	}
 	allowed, err := h.checkACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "read-acl")
 	if err != nil {
-		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate ACL")
 		return
 	}
 	if !allowed {
@@ -239,7 +239,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 	var principalHrefs []string
 	owner, err := h.ownerPrincipalForPath(r.Context(), user, canonicalPath)
 	if err != nil {
-		http.Error(w, "failed to resolve resource owner", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve resource owner")
 		return
 	}
 	if owner != "" {
@@ -248,7 +248,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 	if h != nil && h.store != nil && h.store.ACLEntries != nil {
 		entries, err := h.aclEntriesForResource(r.Context(), canonicalPath)
 		if err != nil {
-			http.Error(w, "failed to load ACL", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load ACL")
 			return
 		}
 		for _, entry := range entries {
@@ -259,7 +259,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		if inheritedPath := inheritedACLSourcePath(canonicalPath); inheritedPath != "" {
 			inherited, err := h.aclEntriesForResource(r.Context(), inheritedPath)
 			if err != nil {
-				http.Error(w, "failed to load inherited ACL", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to load inherited ACL")
 				return
 			}
 			for _, entry := range inherited {
@@ -274,7 +274,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 	for _, href := range principalHrefs {
 		allowed, err := h.checkACLPrivilege(r.Context(), user, href, "read")
 		if err != nil {
-			http.Error(w, "failed to evaluate principal access", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate principal access")
 			return
 		}
 		if !allowed {
@@ -286,14 +286,14 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		}
 		principalResponse, err := h.aclPrincipalResponse(r.Context(), user, href)
 		if err != nil {
-			http.Error(w, "failed to load principal", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to load principal")
 			return
 		}
 		responses = append(responses, principalResponse)
 	}
 	responses, err = h.selectACLReportProperties(r, user, responses, request.Prop)
 	if err != nil {
-		http.Error(w, "failed to build ACL principal response", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to build ACL principal response")
 		return
 	}
 	h.writeReportMultiStatus(w, r, "acl-principal-prop-set", responses, "")
@@ -348,7 +348,7 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 		case errors.Is(err, errTooManyCandidateRows):
 			writeInsufficientStorage(w)
 		default:
-			http.Error(w, "failed to enumerate collection", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to enumerate collection")
 		}
 		return
 	}
@@ -365,7 +365,7 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 		} else {
 			principalHref, err := h.principalPropertyHref(r.Context(), user, candidate, request.PrincipalProperty.Properties[0].XMLName)
 			if err != nil {
-				http.Error(w, "failed to resolve principal property", http.StatusInternalServerError)
+				writeServerFailure(w, err, "failed to resolve principal property")
 				return
 			}
 			matched = ensureCollectionHref(normalizeDAVHref(principalHref)) == currentPrincipal
@@ -381,7 +381,7 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 	}
 	responses, err = h.selectACLReportProperties(r, user, responses, request.Prop)
 	if err != nil {
-		http.Error(w, "failed to build principal-match response", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to build principal-match response")
 		return
 	}
 	h.writeReportMultiStatus(w, r, "principal-match", responses, "")
@@ -421,12 +421,12 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 	}
 	if request.ApplyToPrincipalCollectionSet != nil {
 		responses, err := h.buildPropfindResponses(r.Context(), r, cleanPath, "0", user, nil)
+		if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, errForbidden) {
+			writeServerFailure(w, err, "failed to resolve principal collection set")
+			return
+		}
 		if err != nil || len(responses) == 0 {
-			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) || len(responses) == 0 {
-				http.Error(w, "not found", http.StatusNotFound)
-			} else {
-				http.Error(w, "failed to resolve principal collection set", http.StatusInternalServerError)
-			}
+			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 	}
@@ -436,7 +436,7 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 	}
 	principals, err := h.store.Users.ListActive(r.Context())
 	if err != nil {
-		http.Error(w, "failed to search principals", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to search principals")
 		return
 	}
 	responses := make([]response, 0, len(principals))
@@ -444,7 +444,7 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 		principal := &principals[i]
 		allowed, err := h.checkACLPrivilege(r.Context(), user, h.principalURL(principal), "read")
 		if err != nil {
-			http.Error(w, "failed to evaluate principal access", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to evaluate principal access")
 			return
 		}
 		if !allowed {
@@ -461,7 +461,7 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 	}
 	responses, err = h.selectACLReportProperties(r, user, responses, request.Prop)
 	if err != nil {
-		http.Error(w, "failed to build principal search response", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to build principal search response")
 		return
 	}
 	h.writeReportMultiStatus(w, r, "principal-property-search", responses, "")

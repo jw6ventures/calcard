@@ -665,7 +665,7 @@ func TestCollectionTransferRefusesAMemberWhoseZoneThePoolCouldNotFollow(t *testi
 	req := httptest.NewRequest("MOVE", "/dav/calendars/1/", nil)
 	req = ensureRequestCaches(req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
 	source := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}}
-	members, failures, err := h.preflightCalendarCollectionMembers(req, &store.User{ID: 1}, source, "infinity", store.CalendarCollectionMove)
+	members, failures, _, err := h.preflightCalendarCollectionMembers(req, &store.User{ID: 1}, source, "infinity", store.CalendarCollectionMove)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +732,7 @@ func TestCollectionTransferValidatesTwentyFiveThousandOrdinaryMembersAndARetry(t
 	source := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}}
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		got, failures, err := h.preflightCalendarCollectionMembers(req, &store.User{ID: 1}, source, "infinity", store.CalendarCollectionMove)
+		got, failures, _, err := h.preflightCalendarCollectionMembers(req, &store.User{ID: 1}, source, "infinity", store.CalendarCollectionMove)
 		if err != nil || len(failures) != 0 || len(got) != members {
 			t.Fatalf("attempt %d: %d members validated, %d refused, %v; want all %d", attempt, len(got), len(failures), err, members)
 		}

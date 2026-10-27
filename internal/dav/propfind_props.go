@@ -292,7 +292,15 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 			p.CurrentUserPrivilegeSet = nil
 			p.currentUserPrivilegesForbidden = true
 		} else {
-			if h.store == nil || h.store.ACLEntries != nil || h.isResourceOwner(ctx, user, resourcePath) || p.CurrentUserPrivilegeSet == nil {
+			resolveSet := h.store == nil || h.store.ACLEntries != nil || p.CurrentUserPrivilegeSet == nil
+			if !resolveSet {
+				owner, err := h.isResourceOwner(ctx, user, resourcePath)
+				if err != nil {
+					return err
+				}
+				resolveSet = owner
+			}
+			if resolveSet {
 				// CalendarPrivileges omits ACL-management privileges, so stored ACLs
 				// must still supply the complete property even when a preset exists.
 				privileges, err := h.currentUserPrivilegeSetForPath(ctx, user, requestPath)
@@ -385,8 +393,14 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	}
 
 	cleanPath := cleanDAVPath(resourcePath)
-	if h.isResourceOwner(ctx, user, cleanPath) && isGenericDAVPrivilegePath(cleanPath) {
-		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames), nil
+	if isGenericDAVPrivilegePath(cleanPath) {
+		owner, err := h.isResourceOwner(ctx, user, cleanPath)
+		if err != nil {
+			return nil, err
+		}
+		if owner {
+			return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames), nil
+		}
 	}
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		if isBirthdayCalendarPath(ctx, cleanPath) {

@@ -59,7 +59,7 @@ func writePrivilegeRequirementError(w http.ResponseWriter, err error) bool {
 	case errors.Is(requirement.cause, errForbidden) || isPrivilegeNotGranted(requirement.cause):
 		http.Error(w, "not found", http.StatusNotFound)
 	default:
-		http.Error(w, "failed to evaluate privileges", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to evaluate privileges")
 	}
 	return true
 }

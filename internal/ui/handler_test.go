@@ -4444,6 +4444,10 @@ func (f *fakeAppPasswordRepo) GetByID(ctx context.Context, id int64) (*store.App
 	return nil, nil
 }
 
+func (f *fakeAppPasswordRepo) StillValid(ctx context.Context, id, userID int64, email, tokenHash string) (bool, error) {
+	return false, nil
+}
+
 func (f *fakeAppPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	f.revoked = id
 	return nil

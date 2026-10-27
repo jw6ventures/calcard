@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	pathpkg "path"
 	"strconv"
@@ -22,6 +23,11 @@ type Config struct {
 		MaxOpenConns    int
 		MaxIdleConns    int
 		ConnMaxLifetime time.Duration
+		// ConnectTimeout is the connect_timeout given to DSNs that set none
+		// themselves, so a server that accepts connections but never answers
+		// fails a new connection instead of holding it open for as long as the
+		// server stays hung. Zero leaves the DSN unbounded.
+		ConnectTimeout time.Duration
 	}
 
 	HTTP struct {
@@ -126,6 +132,17 @@ type Config struct {
 		ReportTimeout time.Duration
 	}
 
+	// RateLimit holds the per-client-IP token buckets for the auth endpoints
+	// and for /dav and /api. Each process keeps its own buckets, so behind a
+	// load balancer spreading one client over N replicas the client is
+	// admitted up to N times these rates. A rate of 0 turns that limiter off.
+	RateLimit struct {
+		AuthRPS   float64
+		AuthBurst int
+		DAVRPS    float64
+		DAVBurst  int
+	}
+
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
 	// (PprofAddr). It is off by default and the listener should stay bound to
 	// loopback: the profiling handlers leak runtime internals and the
@@ -151,6 +168,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.DB.ConnMaxLifetime, err = getenvDurationDefault("APP_DB_CONN_MAX_LIFETIME", 30*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DB.ConnectTimeout, err = getenvWindowDefault("APP_DB_CONNECT_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +214,7 @@ func Load() (*Config, error) {
 			cfg.DB.DSN = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, password, host, port, name, sslmode)
 		}
 	}
+	cfg.DB.DSN = withDefaultConnectTimeout(cfg.DB.DSN, cfg.DB.ConnectTimeout)
 
 	cfg.OAuth.ClientID = os.Getenv("APP_OAUTH_CLIENT_ID")
 	cfg.OAuth.ClientSecret = os.Getenv("APP_OAUTH_CLIENT_SECRET")
@@ -251,6 +273,22 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.RateLimit.AuthRPS, err = getenvRateDefault("APP_RATE_LIMIT_AUTH_RPS", DefaultAuthRateLimitRPS)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimit.AuthBurst, err = getenvBurstDefault("APP_RATE_LIMIT_AUTH_BURST", DefaultAuthRateLimitBurst)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimit.DAVRPS, err = getenvRateDefault("APP_RATE_LIMIT_DAV_RPS", DefaultDAVRateLimitRPS)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RateLimit.DAVBurst, err = getenvBurstDefault("APP_RATE_LIMIT_DAV_BURST", DefaultDAVRateLimitBurst)
+	if err != nil {
+		return nil, err
+	}
 	cfg.PprofEnabled = getenvBool("APP_PPROF_ENABLED", false)
 	cfg.PprofAddr = getenvDefault("APP_PPROF_ADDR", "127.0.0.1:6060")
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
@@ -283,6 +321,34 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// withDefaultConnectTimeout adds connect_timeout to dsn, in whole seconds
+// rounded up, unless the operator already chose one in the DSN or through
+// PGCONNECT_TIMEOUT.
+func withDefaultConnectTimeout(dsn string, timeout time.Duration) string {
+	if dsn == "" || timeout <= 0 || os.Getenv("PGCONNECT_TIMEOUT") != "" {
+		return dsn
+	}
+	seconds := strconv.FormatInt(int64((timeout+time.Second-1)/time.Second), 10)
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil || u.Query().Has("connect_timeout") {
+			return dsn
+		}
+		separator := "&"
+		switch {
+		case u.RawQuery != "":
+		case u.ForceQuery:
+			separator = ""
+		default:
+			separator = "?"
+		}
+		return dsn + separator + "connect_timeout=" + seconds
+	}
+	// A later keyword overrides an earlier one, so a connect_timeout the
+	// operator wrote into a keyword/value DSN still wins over this default.
+	return "connect_timeout=" + seconds + " " + dsn
 }
 
 func getenvDefault(key, def string) string {
@@ -361,6 +427,45 @@ func getenvWindowDefault(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a non-negative duration, where 0 turns it off", key)
 	}
 	return d, nil
+}
+
+// Default rate limits, per replica and per client IP. DAV sync clients fan out
+// many small PROPFIND and REPORT requests at once, so DAV gets the larger burst.
+const (
+	DefaultAuthRateLimitRPS   = 5.0
+	DefaultAuthRateLimitBurst = 10
+	DefaultDAVRateLimitRPS    = 20.0
+	DefaultDAVRateLimitBurst  = 100
+)
+
+// getenvRateDefault reads a token-bucket refill rate in requests per second.
+// Fractions are accepted so an operator can divide a fleet-wide rate across
+// replicas, and 0 turns the limiter off, for a deployment that limits at the
+// load balancer instead.
+func getenvRateDefault(key string, def float64) (float64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || !(f >= 0) || math.IsInf(f, 1) {
+		return 0, fmt.Errorf("%s must be a number of requests per second, 0 or more (0 turns the limiter off)", key)
+	}
+	return f, nil
+}
+
+// getenvBurstDefault reads a token-bucket size, which must admit at least one
+// request.
+func getenvBurstDefault(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return n, nil
 }
 
 func getenvList(key string) []string {

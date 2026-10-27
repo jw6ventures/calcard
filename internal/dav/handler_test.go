@@ -6611,10 +6611,10 @@ func TestIsResourceOwnerParsesPrincipalIDPositionally(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	h := &DavServer{store: &store.Store{}}
 
-	if !h.isResourceOwner(context.Background(), user, "/dav/principals/1/") {
+	if owner, err := h.isResourceOwner(context.Background(), user, "/dav/principals/1/"); err != nil || !owner {
 		t.Fatal("expected authenticated principal path to be owned by the matching user")
 	}
-	if h.isResourceOwner(context.Background(), user, "/dav/principals/settings/1/") {
+	if owner, err := h.isResourceOwner(context.Background(), user, "/dav/principals/settings/1/"); err != nil || owner {
 		t.Fatal("expected nested principal path with user ID in a later segment to not be treated as owner path")
 	}
 }

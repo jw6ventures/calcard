@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 	"time"
 	_ "time/tzdata"
@@ -76,6 +77,7 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 
 	logInsecureBasicWarning(&jw6utils, cfg)
+	logPerReplicaLimits(&jw6utils, cfg)
 
 	relayPostgresNotices(&jw6utils)
 	dbManager := database.NewManager(database.Config{
@@ -168,6 +170,32 @@ func logInsecureBasicWarning(sink logging.Sink, cfg *config.Config) {
 		return
 	}
 	logging.New(sink, "Main").Warn("runServer", "APP_DAV_INSECURE_BASIC_ENABLED is set: HTTP Basic is accepted on /dav and /api over plain HTTP, so app passwords and all calendar and contact data cross the network in cleartext. RFC 4791 Section 11 forbids Basic without TLS; terminate TLS in front of CalCard and unset it where you can")
+}
+
+// logPerReplicaLimits states the database pool and rate limits this process
+// enforces. Neither is shared between replicas, so a fleet's connection count
+// and the rate it admits from one client are these figures times the replica
+// count.
+func logPerReplicaLimits(sink logging.Sink, cfg *config.Config) {
+	maxOpen := "unlimited"
+	if cfg.DB.MaxOpenConns > 0 {
+		maxOpen = strconv.Itoa(cfg.DB.MaxOpenConns)
+	}
+	logging.New(sink, "Main").Info("runServer",
+		"limits per replica (each replica enforces its own; multiply by the replica count for the fleet): "+
+			"database pool max open %s, max idle %d, conn max lifetime %s; "+
+			"rate limits per client IP: auth %s, DAV and API %s",
+		maxOpen, cfg.DB.MaxIdleConns, cfg.DB.ConnMaxLifetime,
+		describeRateLimit(cfg.RateLimit.AuthRPS, cfg.RateLimit.AuthBurst), describeRateLimit(cfg.RateLimit.DAVRPS, cfg.RateLimit.DAVBurst))
+}
+
+// describeRateLimit spells one limiter for the startup line; a rate of 0 is a
+// limiter turned off.
+func describeRateLimit(rps float64, burst int) string {
+	if rps <= 0 {
+		return "off"
+	}
+	return fmt.Sprintf("%g req/s burst %d", rps, burst)
 }
 
 func openTrafficCaptureFile(path string) (*os.File, error) {

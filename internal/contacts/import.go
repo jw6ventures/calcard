@@ -171,6 +171,9 @@ func (b *importBatch) flush(ctx context.Context) error {
 		refusal = contactWriteError(refusal)
 		if refusal != nil && !errors.Is(refusal, ErrLocked) && !store.IsDataError(refusal) {
 			refusal = b.service.importCard(ctx, b.user, b.book.ID, card.uid, card.card)
+			if errors.Is(refusal, ErrChangedConcurrently) {
+				refusal = b.service.settleChangedImport(ctx, b.user, b.book, card.uid, card.card)
+			}
 		}
 		if refusal == nil {
 			b.result.Imported++
@@ -236,6 +239,38 @@ func (s *Service) importCard(ctx context.Context, user *store.User, bookID int64
 		}
 	}
 	return err
+}
+
+// settleChangedImport answers for a card whose write kept losing while the
+// import retried it, as the calendar import answers for an event another
+// writer stored first: nil when the contact now holds what storing the card
+// would leave and the user may write it, the refusal a fresh decision of the
+// card meets, ErrConflict when the name a new contact would take is held by
+// one of another UID, which refuses every create of the card, or else
+// ErrPreconditionFailed.
+func (s *Service) settleChangedImport(ctx context.Context, user *store.User, book *store.AddressBook, uid, card string) error {
+	if uid == "" {
+		return ErrPreconditionFailed
+	}
+	write, err := s.importWrite(ctx, user, book, uid, card)
+	if err != nil {
+		return err
+	}
+	stored, err := s.store.Contacts.GetByUID(ctx, book.ID, uid)
+	if err != nil {
+		return err
+	}
+	if stored != nil && stored.RawVCard == write.RawVCard {
+		return nil
+	}
+	holder, err := s.store.Contacts.GetByResourceName(ctx, book.ID, write.ResourceName)
+	if err != nil {
+		return err
+	}
+	if holder != nil && holder.UID != uid {
+		return ErrConflict
+	}
+	return ErrPreconditionFailed
 }
 
 func isImportSkip(err error) bool {

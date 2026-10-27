@@ -201,7 +201,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			return
 		}
 		h.logger().Error("Report", "failed to resolve calendar for %s: %v", cleanPath, err)
-		http.Error(w, "failed to resolve calendar", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve calendar")
 		return
 	}
 	if !ok {
@@ -214,7 +214,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			if h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 				return
 			}
-			http.Error(w, "failed to resolve calendar-multiget href", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to resolve calendar-multiget href")
 			return
 		}
 		if !equivalent {
@@ -245,11 +245,12 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			writeNeedPrivileges(w, cleanPath, loadPrivilege)
 			return
 		}
-		status := http.StatusInternalServerError
 		if errors.Is(err, store.ErrNotFound) {
-			status = http.StatusNotFound
+			http.Error(w, "calendar not found", http.StatusNotFound)
+			return
 		}
-		http.Error(w, "calendar not found", status)
+		h.logger().Error("Report", "failed to load calendar for %s: %v", cleanPath, err)
+		writeServerFailure(w, err, "failed to load calendar")
 		return
 	}
 	canonicalPath := path.Join("/dav/calendars", fmt.Sprint(cal.ID))
@@ -444,7 +445,7 @@ func writeReportError(w http.ResponseWriter, err error) {
 	default:
 		// The message is fixed rather than taken from err, which carries
 		// storage and query detail a client has no business reading.
-		http.Error(w, "failed to build report response", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to build report response")
 	}
 }
 
@@ -579,7 +580,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		if h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 			return
 		}
-		http.Error(w, "failed to resolve address book", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve address book")
 		return
 	}
 	if !ok {
@@ -615,11 +616,12 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 			writeNeedPrivileges(w, cleanPath, "read")
 			return
 		}
-		status := http.StatusInternalServerError
 		if errors.Is(err, store.ErrNotFound) {
-			status = http.StatusNotFound
+			http.Error(w, "address book not found", http.StatusNotFound)
+			return
 		}
-		http.Error(w, "address book not found", status)
+		h.logger().Error("Report", "failed to load address book for %s: %v", cleanPath, err)
+		writeServerFailure(w, err, "failed to load address book")
 		return
 	}
 	// Depth:0 on a collection for addressbook-query means only the collection

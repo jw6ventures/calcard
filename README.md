@@ -171,9 +171,10 @@ Environment variables:
 | `APP_DB_PASSWORD` | true | Required when not providing `APP_DB_DSN`. |
 | `APP_DB_PORT` | false | (Default `5432`) Used when not providing `APP_DB_DSN`. |
 | `APP_DB_SSLMODE` | false | (Default `disable`) Used when not providing `APP_DB_DSN`. |
-| `APP_DB_MAX_OPEN_CONNS` | false | (Default `25`) Maximum number of open database connections. |
-| `APP_DB_MAX_IDLE_CONNS` | false | (Default `10`) Maximum number of idle database connections kept in the pool. |
+| `APP_DB_MAX_OPEN_CONNS` | false | (Default `25`) Maximum number of open database connections, per instance. `0` means no limit. See [Running more than one instance](#running-more-than-one-instance). |
+| `APP_DB_MAX_IDLE_CONNS` | false | (Default `10`) Maximum number of idle database connections kept in the pool, per instance. |
 | `APP_DB_CONN_MAX_LIFETIME` | false | (Default `30m`) Maximum lifetime of a database connection before it is recycled (Go duration, ex. `30m`). |
+| `APP_DB_CONNECT_TIMEOUT` | false | (Default `5s`; Go duration, rounded up to whole seconds) How long opening a database connection may take, added to the DSN as `connect_timeout` unless the DSN or `PGCONNECT_TIMEOUT` already sets one. `0` leaves connections unbounded, so a hung database holds every new connection for as long as it stays hung. |
 | `APP_OAUTH_CLIENT_ID` | true | Provided from IDP |
 | `APP_OAUTH_CLIENT_SECRET` | true | Provided from IDP |
 | `APP_OAUTH_ISSUER_URL` | one of two | Provided from IDP. Used if `APP_OAUTH_DISCOVERY_URL` is not set. |
@@ -182,7 +183,7 @@ Environment variables:
 | `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
 | `APP_TRUSTED_PROXIES` | false | Comma-separated IPs/CIDRs of the reverse proxies that connect to CalCard directly. See [Running behind a reverse proxy](#running-behind-a-reverse-proxy). If none are specified, CalCard trusts all proxies - Not recommended for public environments |
 | `APP_HTTP_READ_TIMEOUT` | false | (Default `15s`) Maximum duration for reading an entire request, including the body (Go duration). |
-| `APP_HTTP_WRITE_TIMEOUT` | false | (Default `15s`) Maximum duration before timing out writes of the response (Go duration). |
+| `APP_HTTP_WRITE_TIMEOUT` | false | (Default `15s`) Maximum duration before timing out writes of the response (Go duration). A request's work, its database statements included, is canceled once it has run this long, since its response can no longer be written. |
 | `APP_HTTP_IDLE_TIMEOUT` | false | (Default `60s`) Maximum time to wait for the next request on a keep-alive connection (Go duration). |
 | `APP_TRAFFIC_CAPTURE_FILE` | false | Enables diagnostic request capture when set to a JSONL file path. Captures method, path, headers, request body (up to 10 MiB), client IP, timing offset, and response status. Basic credentials are replaced with `${CALCARD_DAV_BASIC_AUTH}` and cookies/tokens are redacted, but calendar, contact, and other body data remains sensitive. The file is appended with `0600` permissions; move or remove it before starting a distinct capture session. |
 | `APP_PPROF_ENABLED` | false | (Default `false`) Exposes `net/http/pprof` profiling on a dedicated debug listener (`APP_PPROF_ADDR`). The endpoints leak runtime internals and can be used to DoS the process - keep the listener on loopback and reach it via an SSH tunnel. |
@@ -217,6 +218,19 @@ CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a 
 | `APP_DAV_SYNC_HISTORY_RETENTION` | false | (Default `2160h`, 90 days; Go duration) How far back sync deletion history is kept. A sync token older than this is refused with `DAV:valid-sync-token` and the client re-syncs in full. `0` prunes nothing. Widening it re-admits tokens whose deletions were already pruned, so widen only when no client holds a token older than the previous window. |
 | `APP_DAV_REPORT_TIMEOUT` | false | (Default `10s`; Go duration) How long one REPORT may run before it is stopped and refused. Keep it below `APP_HTTP_WRITE_TIMEOUT`. `0` turns it off. |
 
+Rate limits. Each client IP (see [Running behind a reverse proxy](#running-behind-a-reverse-proxy)) gets a token bucket that refills at the given rate and holds up to the burst. A request over the limit gets `429 Too Many Requests`. Each instance keeps its own buckets: see [Running more than one instance](#running-more-than-one-instance). Rates may be fractional (ex. `2.5`). A rate of `0` turns that limiter off, for a fleet that limits at its load balancer; bursts must be at least `1`.
+| Name | Required | Notes |
+| --- | --- | --- |
+| `APP_RATE_LIMIT_AUTH_RPS` | false | (Default `5`) Requests per second, per client IP, to `/auth/login` and the OAuth callback. |
+| `APP_RATE_LIMIT_AUTH_BURST` | false | (Default `10`) Requests a client IP may make at once to those endpoints. |
+| `APP_RATE_LIMIT_DAV_RPS` | false | (Default `20`) Requests per second, per client IP, to `/dav` and `/api`. |
+| `APP_RATE_LIMIT_DAV_BURST` | false | (Default `100`) Requests a client IP may make at once to `/dav` and `/api`. Sync clients send many requests at once, so keep this generous. |
+
+### Running more than one instance
+Rate limits and the database pool belong to each CalCard instance. Nothing is shared between instances. CalCard logs both at startup.
+- **Rate limits.** Behind a load balancer that spreads one client over N instances, that client is admitted up to N times the configured rate and burst. To hold a client to a fleet-wide rate, divide it by N. For example, with 4 instances and a target of 20 requests per second, set `APP_RATE_LIMIT_DAV_RPS=5`. A load balancer that keeps each client on one instance keeps the configured rate as it is.
+- **Database connections.** Each instance opens up to `APP_DB_MAX_OPEN_CONNS` connections. `APP_DB_MAX_OPEN_CONNS` × instances, plus room for migrations, maintenance and any other clients, must stay below PostgreSQL's `max_connections` (`100` by default). Past it, PostgreSQL refuses new connections with `too many connections` and requests fail. For example, 5 instances at the default `25` need 125 connections. Lower `APP_DB_MAX_OPEN_CONNS`, raise `max_connections`, or put a connection pooler such as PgBouncer in front of PostgreSQL.
+
 
 ## Connecting a CalDAV/CardDAV client
 - Sign in to the web UI
@@ -234,7 +248,7 @@ HTTP Digest (SHA-256 or MD5) is off by default. Turn it on with `APP_DAV_DIGEST_
 
 ## Health probes
 - Liveness: `GET /healthz` returns immediately when the HTTP server is running, without touching dependencies.
-- Readiness: `GET /readyz` checks connectivity to critical dependencies and returns `503 Service Unavailable` until they are reachable.
+- Readiness: `GET /readyz` checks connectivity to critical dependencies and returns `503 Service Unavailable` until they are reachable. It answers within 2 seconds, so a database that has stopped responding reads as unready rather than as a probe timeout.
 
 ## License
 

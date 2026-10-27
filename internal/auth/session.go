@@ -119,12 +119,20 @@ func (m *SessionManager) GetSession(ctx context.Context, r *http.Request) (*stor
 	return session, nil
 }
 
-func (m *SessionManager) CurrentUserID(ctx context.Context, r *http.Request) (int64, string, bool) {
+// CurrentUserID returns the user and session r's session cookie names, and ok
+// false when it names no live session. A cookie value PostgreSQL refuses, such
+// as one that is not valid UTF-8, names no session either. Any other failure
+// to read the session is returned: it says nothing about whether the visitor
+// is logged in.
+func (m *SessionManager) CurrentUserID(ctx context.Context, r *http.Request) (userID int64, sessionID string, ok bool, err error) {
 	session, err := m.GetSession(ctx, r)
-	if err != nil || session == nil {
-		return 0, "", false
+	if err != nil && !store.IsDataError(err) {
+		return 0, "", false, err
 	}
-	return session.UserID, session.ID, true
+	if session == nil {
+		return 0, "", false, nil
+	}
+	return session.UserID, session.ID, true, nil
 }
 
 func generateSessionID() (string, error) {

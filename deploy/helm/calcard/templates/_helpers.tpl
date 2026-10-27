@@ -36,3 +36,33 @@ would truncate 1.5 to 1 and turn "abc" into 0.
 {{- end -}}
 {{- $text -}}
 {{- end -}}
+
+{{- /*
+calcard.rate renders a rate as decimal text, taking (list "values.path" value).
+--set passes a fraction such as 2.5 as a string and a values file as a float64,
+so both are accepted; a whole number renders without a fraction or exponent.
+Zero turns the limiter off. The server refuses a negative or unparsable rate,
+so this refuses it at render, for installs run with --skip-schema-validation.
+*/ -}}
+{{- define "calcard.rate" -}}
+{{- $path := index . 0 -}}
+{{- $value := index . 1 -}}
+{{- $text := "" -}}
+{{- if or (kindIs "float64" $value) (kindIs "int" $value) (kindIs "int64" $value) -}}
+{{- if ge (float64 $value) 0.0 -}}
+{{- if eq (float64 $value) (float64 (int64 $value)) -}}
+{{- $text = toString (int64 $value) -}}
+{{- else -}}
+{{- $text = toString $value -}}
+{{- end -}}
+{{- end -}}
+{{- else if kindIs "string" $value -}}
+{{- if regexMatch "^([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$" $value -}}
+{{- $text = $value -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $text "" -}}
+{{- fail (printf "%s must be a number, 0 or more (got %v)" $path $value) -}}
+{{- end -}}
+{{- $text -}}
+{{- end -}}

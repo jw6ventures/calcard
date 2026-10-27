@@ -202,3 +202,26 @@ func ensureCollectionHref(p string) string {
 	}
 	return p
 }
+
+// writeServerFailure answers a request that failed with err for a reason of
+// the server's own. While the store is unavailable it answers 503 with the
+// status text alone so a client retries rather than giving up; otherwise it
+// answers 500 with message.
+func writeServerFailure(w http.ResponseWriter, err error, message string) {
+	if store.IsUnavailable(err) {
+		writeStatusText(w, http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, message, http.StatusInternalServerError)
+}
+
+// writeStoreUnavailable answers 503 and reports true when err shows the store
+// is unavailable. Callers that map a failed lookup to a client status, such as
+// 404 or 403, check it first so an outage never reads as a missing resource.
+func writeStoreUnavailable(w http.ResponseWriter, err error) bool {
+	if !store.IsUnavailable(err) {
+		return false
+	}
+	writeStatusText(w, http.StatusServiceUnavailable)
+	return true
+}

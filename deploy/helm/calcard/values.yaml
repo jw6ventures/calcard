@@ -52,9 +52,10 @@ app:
     user: "postgres" # Database user.
     password: "" # Database password. Stored in a generated Secret. Ignored if existingSecret.name is set.
     sslmode: "disable" # Postgres sslmode (disable, require, verify-ca, verify-full). Use a stronger mode for external databases.
-    maxOpenConns: 25 # Maximum number of open database connections.
-    maxIdleConns: 10 # Maximum number of idle database connections.
+    maxOpenConns: 25 # Maximum number of open database connections, per pod. Every pod opens its own pool, so maxOpenConns x pods, plus room for migrations and any other clients, must stay below PostgreSQL max_connections (100 by default), or put a pooler such as PgBouncer in front.
+    maxIdleConns: 10 # Maximum number of idle database connections, per pod.
     connMaxLifetime: "30m" # Maximum lifetime for a database connection.
+    connectTimeout: "5s" # How long opening a database connection may take (rounded up to whole seconds). Added to the DSN as connect_timeout unless the DSN already sets one. "0" turns it off.
     existingSecret: # Reference an existing Secret holding the DB credentials instead of generating one from the values above.
       name: "" # Name of the existing Secret. Leave empty to generate one.
       dsnKey: "APP_DB_DSN" # Key holding the full connection string (postgres://user:pass@host:port/db?sslmode=...).
@@ -87,6 +88,19 @@ app:
     # syncHistoryRetention: 2160h # How far back sync deletion history is kept. Tombstones older than this are pruned, and a DAV:sync-token naming an earlier instant is refused with DAV:valid-sync-token so the client re-syncs in full (RFC 6578 Section 3.2). Set 0 to prune nothing, at the cost of a table that only grows.
     # Narrow this freely. Widening it re-admits tokens whose tombstones the old window already pruned, which loses those deletions silently, so widen only when no client holds a token older than the previous window.
     # reportTimeout: 10s # How long one REPORT may run before the server stops it and answers DAV:number-of-matches-within-limits (calendar-multiget answers 507). Keep it below the HTTP write timeout (15s) so the answer can still be written. Set 0 to turn the deadline off.
+
+  # Rate limits per client IP: a token bucket that refills at the rate (requests
+  # per second, fractions allowed) and holds up to the burst; a request over it
+  # gets 429. Each pod keeps its own buckets, so a load balancer spreading a
+  # client over N pods admits up to N times these; divide by N to hold a
+  # fleet-wide rate. Leave a key unset to use the server default, shown in the
+  # comment. A rate of 0 turns that limiter off, for a fleet that limits at the
+  # load balancer. Bursts must be at least 1.
+  rateLimit: {}
+    # authRps: 5 # Requests per second to /auth/login and the OAuth callback.
+    # authBurst: 10 # Requests at once to /auth/login and the OAuth callback.
+    # davRps: 20 # Requests per second to /dav and /api.
+    # davBurst: 100 # Requests at once to /dav and /api. Sync clients send many requests at once, so keep this generous.
 
 # Kubernetes Service that fronts the app pods.
 service:

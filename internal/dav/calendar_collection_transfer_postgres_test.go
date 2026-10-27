@@ -1,13 +1,17 @@
 package dav
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -317,6 +321,530 @@ CREATE TRIGGER record_advisory_locks BEFORE DELETE ON calendars FOR EACH ROW EXE
 			}
 			if few, many := locksFor(3), locksFor(60); few != many {
 				t.Errorf("%s held %d advisory locks for 3 members and %d for 60", method, few, many)
+			}
+		})
+	}
+}
+
+// writtenMember is one member a writer created, with the instants that bound
+// when it existed: it was certainly stored from created on, and certainly gone
+// from deleted on, while a delete sent at deleteSent may have removed it any
+// time after.
+type writtenMember struct {
+	body       string
+	created    time.Time
+	deleteSent time.Time
+	deleted    time.Time
+}
+
+func writtenMemberBody(name string) string {
+	return fmt.Sprintf("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Review//EN\r\nBEGIN:VEVENT\r\nUID:%s\r\nSUMMARY:%s\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T100000Z\r\nDTEND:20260101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", name, name)
+}
+
+func serveCalendarRequest(ctx context.Context, user *store.User, h *DavServer, method, target, payload string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(payload))
+	if payload != "" {
+		req.Header.Set("Content-Type", "text/calendar")
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, user)))
+	return rr
+}
+
+// seedWrittenMembers PUTs count members named prefix-0 onwards into the
+// calendar at root.
+func seedWrittenMembers(t *testing.T, db *store.Store, user *store.User, root, prefix string, count int) map[string]*writtenMember {
+	t.Helper()
+	h := NewDavServer(Options{Store: db})
+	members := make(map[string]*writtenMember, count)
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf("%s-%d", prefix, i)
+		if rr := serveCalendarRequest(t.Context(), user, h, http.MethodPut, root+"/"+name+".ics", writtenMemberBody(name)); rr.Code != http.StatusCreated {
+			t.Fatalf("seed %s: %d %s", name, rr.Code, rr.Body.String())
+		}
+		members[name] = &writtenMember{body: writtenMemberBody(name), created: time.Now()}
+	}
+	return members
+}
+
+// memberWriters are clients, each on a replica of its own, that never pause
+// between creating a member of one calendar and deleting the one they created
+// before it. members holds every member a writer was told it created.
+type memberWriters struct {
+	t            *testing.T
+	mu           sync.Mutex
+	members      map[string]*writtenMember
+	serverErrors []string
+	ops          atomic.Int64
+	stop         chan struct{}
+	wg           sync.WaitGroup
+}
+
+func startMemberWriters(t *testing.T, db *store.Store, user *store.User, root string, writers int) *memberWriters {
+	w := &memberWriters{t: t, members: make(map[string]*writtenMember), stop: make(chan struct{})}
+	ctx := t.Context()
+	for g := 0; g < writers; g++ {
+		w.wg.Add(1)
+		go func(g int) {
+			defer w.wg.Done()
+			replica := NewDavServer(Options{Store: db})
+			previous := ""
+			for k := 0; ; k++ {
+				select {
+				case <-w.stop:
+					return
+				default:
+				}
+				name := fmt.Sprintf("w%d-%d", g, k)
+				rr := serveCalendarRequest(ctx, user, replica, http.MethodPut, root+"/"+name+".ics", writtenMemberBody(name))
+				acked := time.Now()
+				w.mu.Lock()
+				w.recordServerError(rr, "PUT "+name)
+				if rr.Code == http.StatusCreated {
+					w.members[name] = &writtenMember{body: writtenMemberBody(name), created: acked}
+				}
+				if previous != "" {
+					w.members[previous].deleteSent = time.Now()
+				}
+				w.mu.Unlock()
+				if previous != "" {
+					rr := serveCalendarRequest(ctx, user, replica, http.MethodDelete, root+"/"+previous+".ics", "")
+					acked := time.Now()
+					w.mu.Lock()
+					w.recordServerError(rr, "DELETE "+previous)
+					if rr.Code == http.StatusNoContent {
+						w.members[previous].deleted = acked
+					}
+					w.mu.Unlock()
+				}
+				previous = ""
+				if rr.Code == http.StatusCreated {
+					previous = name
+				}
+				w.ops.Add(1)
+			}
+		}(g)
+	}
+	return w
+}
+
+func (w *memberWriters) recordServerError(rr *httptest.ResponseRecorder, request string) {
+	if rr.Code >= 500 {
+		w.serverErrors = append(w.serverErrors, fmt.Sprintf("%s = %d %s", request, rr.Code, rr.Body.String()))
+	}
+}
+
+// waitForMoreOps waits for the writers to make at least n more operations.
+func (w *memberWriters) waitForMoreOps(n int64) {
+	w.t.Helper()
+	target := w.ops.Load() + n
+	deadline := time.Now().Add(30 * time.Second)
+	for w.ops.Load() < target {
+		if time.Now().After(deadline) {
+			w.t.Fatalf("writers made %d operations, want %d", w.ops.Load(), target)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// finish stops the writers and fails the test for any write the server
+// answered with a 5xx.
+func (w *memberWriters) finish() {
+	w.t.Helper()
+	close(w.stop)
+	w.wg.Wait()
+	for _, failure := range w.serverErrors {
+		w.t.Errorf("member write failed on the server: %s", failure)
+	}
+}
+
+func storedMembersByName(t *testing.T, db *store.Store, calendarID int64) map[string]store.Event {
+	t.Helper()
+	events, err := db.Events.ListForCalendar(t.Context(), calendarID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]store.Event, len(events))
+	for _, event := range events {
+		if _, duplicate := byName[eventResourceName(event)]; duplicate {
+			t.Errorf("calendar %d holds %q twice", calendarID, eventResourceName(event))
+		}
+		byName[eventResourceName(event)] = event
+	}
+	return byName
+}
+
+func calendarWithSlug(t *testing.T, db *store.Store, userID int64, slug string) *store.Calendar {
+	t.Helper()
+	calendars, err := db.Calendars.ListByUser(t.Context(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range calendars {
+		if calendars[i].Slug != nil && *calendars[i].Slug == slug {
+			return &calendars[i]
+		}
+	}
+	return nil
+}
+
+const (
+	continuousWriters    = 4
+	opsAroundTheTransfer = 10
+)
+
+// A whole-collection COPY or MOVE holds its collection while it reads and
+// writes the members, so writers on other replicas that never pause queue
+// behind it rather than leaving it to retry until it gives up. The transferred
+// collection holds exactly the members stored at the instant it committed, and
+// no write a writer was told succeeded is lost.
+func TestPostgresCalendarCollectionTransferUnderContinuousMemberWrites(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			db := newDAVPostgresStore(t)
+			ctx := t.Context()
+			owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Source"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := calendarCollectionResourcePath(source.ID)
+			seeded := seedWrittenMembers(t, db, owner, root, "seed", 20)
+			writers := startMemberWriters(t, db, owner, root, continuousWriters)
+			writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+
+			slug := strings.ToLower(method) + "-target"
+			req := httptest.NewRequest(method, root+"/", nil)
+			req.Header.Set("Destination", "/dav/calendars/"+slug+"/")
+			transferStarted := time.Now()
+			rr := httptest.NewRecorder()
+			NewDavServer(Options{Store: db}).ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, owner)))
+			transferEnded := time.Now()
+			writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+			writers.finish()
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("%s under continuous member writes = %d, want 201: %s", method, rr.Code, rr.Body.String())
+			}
+			target := calendarWithSlug(t, db, owner.ID, slug)
+			if target == nil {
+				t.Fatalf("no calendar at %q after %s", slug, method)
+			}
+			if remains, err := db.Calendars.GetByID(ctx, source.ID); (err == nil && remains != nil) != (method == "COPY") {
+				t.Fatalf("source after %s = %#v, %v", method, remains, err)
+			}
+			members := writers.members
+			for name, member := range seeded {
+				members[name] = member
+			}
+
+			transferred := storedMembersByName(t, db, target.ID)
+			for name, event := range transferred {
+				member, known := members[name]
+				if !known {
+					t.Errorf("%s target holds %q, which no writer was told it created", method, name)
+					continue
+				}
+				if event.RawICAL != member.body {
+					t.Errorf("%s target holds %q with a body it was never written with", method, name)
+				}
+			}
+			for name, member := range members {
+				_, present := transferred[name]
+				storedThroughout := member.created.Before(transferStarted) && (member.deleteSent.IsZero() || member.deleteSent.After(transferEnded))
+				goneBefore := !member.deleted.IsZero() && member.deleted.Before(transferStarted)
+				if storedThroughout && !present {
+					t.Errorf("%s target is missing %q, stored throughout the transfer", method, name)
+				}
+				if goneBefore && present {
+					t.Errorf("%s target holds %q, deleted before the transfer began", method, name)
+				}
+			}
+
+			final := transferred
+			if method == "COPY" {
+				final = storedMembersByName(t, db, source.ID)
+			}
+			for name, member := range members {
+				_, present := final[name]
+				if member.deleted.IsZero() && !present {
+					t.Errorf("write of %q was acknowledged but is lost after %s", name, method)
+				}
+				if !member.deleted.IsZero() && present {
+					t.Errorf("delete of %q was acknowledged but it remains after %s", name, method)
+				}
+			}
+		})
+	}
+}
+
+// A COPY or MOVE over an existing collection that writers on other replicas
+// keep changing holds that collection too, and replaces it as it stands: the
+// collection at the destination afterwards holds the source's members and
+// nothing a writer put in the one it replaced.
+func TestPostgresCalendarCollectionOverwriteUnderContinuousDestinationWrites(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			db := newDAVPostgresStore(t)
+			ctx := t.Context()
+			owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Source"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			slug := strings.ToLower(method) + "-target"
+			destination, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Replaced", Slug: &slug})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceRoot, destinationRoot := calendarCollectionResourcePath(source.ID), calendarCollectionResourcePath(destination.ID)
+			seeded := seedWrittenMembers(t, db, owner, sourceRoot, "seed", 20)
+			seedWrittenMembers(t, db, owner, destinationRoot, "replaced", 5)
+			writers := startMemberWriters(t, db, owner, destinationRoot, continuousWriters)
+			writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+
+			req := httptest.NewRequest(method, sourceRoot+"/", nil)
+			req.Header.Set("Destination", "/dav/calendars/"+slug+"/")
+			req.Header.Set("Overwrite", "T")
+			rr := httptest.NewRecorder()
+			NewDavServer(Options{Store: db}).ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, owner)))
+			writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+			writers.finish()
+
+			if rr.Code != http.StatusNoContent {
+				t.Fatalf("%s over a collection under continuous member writes = %d, want 204: %s", method, rr.Code, rr.Body.String())
+			}
+			target := calendarWithSlug(t, db, owner.ID, slug)
+			if target == nil || target.ID == destination.ID {
+				t.Fatalf("calendar at %q after %s = %#v, want a new one", slug, method, target)
+			}
+			if replaced, err := db.Calendars.GetByID(ctx, destination.ID); err == nil && replaced != nil {
+				t.Fatalf("replaced calendar remains after %s: %#v", method, replaced)
+			}
+			if remaining := storedMembersByName(t, db, destination.ID); len(remaining) != 0 {
+				t.Errorf("%d members of the replaced calendar remain after %s", len(remaining), method)
+			}
+			transferred := storedMembersByName(t, db, target.ID)
+			if len(transferred) != len(seeded) {
+				t.Errorf("%s target holds %d members, want the source's %d", method, len(transferred), len(seeded))
+			}
+			for name, member := range seeded {
+				if event, present := transferred[name]; !present || event.RawICAL != member.body {
+					t.Errorf("%s target holds %q as %#v, want the source's member", method, name, event)
+				}
+			}
+		})
+	}
+}
+
+// A collection DELETE holds its collection while it removes it, so writers on
+// other replicas that never pause queue behind it rather than leaving it to
+// fail. Nothing of the collection survives it: no member a writer was told it
+// created, and none of the state kept beside the members.
+func TestPostgresCalendarCollectionDeleteUnderContinuousMemberWrites(t *testing.T) {
+	var pool *sql.DB
+	db := openDAVPostgresStore(t, func(dsn string) (*sql.DB, error) {
+		var err error
+		pool, err = sql.Open("postgres", dsn)
+		return pool, err
+	})
+	ctx := t.Context()
+	owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calendar, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Doomed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := calendarCollectionResourcePath(calendar.ID)
+	seedWrittenMembers(t, db, owner, root, "seed", 20)
+	if err := db.ACLEntries.SetACL(ctx, root+"/seed-0", []store.ACLEntry{{PrincipalHref: acl.PrincipalHref(owner.ID), IsGrant: true, Privilege: "read"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.ExecContext(ctx, `INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at) VALUES ($1, 'urn:review', 'note', 'x', NOW(), NOW())`, root+"/seed-1"); err != nil {
+		t.Fatal(err)
+	}
+	writers := startMemberWriters(t, db, owner, root, continuousWriters)
+	writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+
+	rr := serveCalendarRequest(ctx, owner, NewDavServer(Options{Store: db}), http.MethodDelete, root+"/", "")
+	writers.waitForMoreOps(continuousWriters * opsAroundTheTransfer)
+	writers.finish()
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("DELETE under continuous member writes = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+	assertNothingRemainsOfCalendar(t, pool, calendar.ID)
+}
+
+// assertNothingRemainsOfCalendar fails the test for any row a removed calendar
+// left behind.
+func assertNothingRemainsOfCalendar(t *testing.T, pool *sql.DB, calendarID int64) {
+	t.Helper()
+	root := calendarCollectionResourcePath(calendarID)
+	for _, check := range []struct {
+		table, query string
+		args         []any
+	}{
+		{"calendars", `SELECT count(*) FROM calendars WHERE id=$1`, []any{calendarID}},
+		{"events", `SELECT count(*) FROM events WHERE calendar_id=$1`, []any{calendarID}},
+		{"deleted_resources", `SELECT count(*) FROM deleted_resources WHERE resource_type='event' AND collection_id=$1`, []any{calendarID}},
+		{"dav_dead_properties", `SELECT count(*) FROM dav_dead_properties WHERE resource_path=$1 OR resource_path LIKE $2`, []any{root, root + "/%"}},
+		{"acl_entries", `SELECT count(*) FROM acl_entries WHERE resource_path=$1 OR resource_path LIKE $2`, []any{root, root + "/%"}},
+		{"locks", `SELECT count(*) FROM locks WHERE resource_path=$1 OR resource_path LIKE $2`, []any{root, root + "/%"}},
+	} {
+		var count int
+		if err := pool.QueryRowContext(t.Context(), check.query, check.args...).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%d %s rows remain for removed calendar %d", count, check.table, calendarID)
+		}
+	}
+}
+
+// calendarListChurn adds a member to calendarID right after every listing of
+// it, so each preflight a collection transfer makes is stale by one member
+// before its transaction begins.
+type calendarListChurn struct {
+	store.EventRepository
+	calendarID int64
+	add        func(n int) error
+	added      int
+}
+
+func (r *calendarListChurn) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
+	events, err := r.EventRepository.ListForCalendar(ctx, calendarID)
+	if err == nil && calendarID == r.calendarID {
+		r.added++
+		if err := r.add(r.added); err != nil {
+			return nil, err
+		}
+	}
+	return events, err
+}
+
+// A guest's COPY of a shared calendar whose members change after every
+// preflight transfers the members stored once its transaction holds the
+// collection, and decides the guest's read privilege on each member it did
+// not preflight from the ACL stored at that member then.
+func TestPostgresCalendarCollectionCopyChecksMembersAddedAfterThePreflight(t *testing.T) {
+	for _, denied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("denied=%t", denied), func(t *testing.T) {
+			db := newDAVPostgresStore(t)
+			ctx := t.Context()
+			owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			guest, err := db.Users.UpsertOAuthUser(ctx, "guest", "guest@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			calendar, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Shared"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := fmt.Sprintf("/dav/calendars/%d", calendar.ID)
+			if err := db.ACLEntries.SetACL(ctx, root, []store.ACLEntry{{PrincipalHref: acl.PrincipalHref(guest.ID), IsGrant: true, Privilege: "read"}}); err != nil {
+				t.Fatal(err)
+			}
+			repo := db.Events
+			db.Events = &calendarListChurn{EventRepository: repo, calendarID: calendar.ID, add: func(n int) error {
+				name := fmt.Sprintf("late-%d", n)
+				raw := fmt.Sprintf("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Review//EN\r\nBEGIN:VEVENT\r\nUID:%s\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T100000Z\r\nDTEND:20260101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", name)
+				if _, err := repo.Upsert(ctx, store.Event{CalendarID: calendar.ID, UID: name, ResourceName: name, ETag: name, RawICAL: raw}); err != nil {
+					return err
+				}
+				if !denied {
+					return nil
+				}
+				return db.ACLEntries.SetACL(ctx, root+"/"+name, []store.ACLEntry{{PrincipalHref: acl.PrincipalHref(guest.ID), IsGrant: false, Privilege: "read"}})
+			}}
+			h := NewDavServer(Options{Store: db})
+
+			req := httptest.NewRequest("COPY", root+"/", nil)
+			req.Header.Set("Destination", "/dav/calendars/guest-copy/")
+			req.Header.Set("Depth", "infinity")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, guest)))
+			copies, err := db.Calendars.ListByUser(ctx, guest.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if denied {
+				if rr.Code != http.StatusMultiStatus || !strings.Contains(rr.Body.String(), root+"/late-1.ics") {
+					t.Fatalf("COPY of a member the guest may not read = %d, want 207 naming it: %s", rr.Code, rr.Body.String())
+				}
+				if len(copies) != 0 {
+					t.Fatalf("guest holds %d calendars copied with a member it may not read", len(copies))
+				}
+				return
+			}
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("COPY of a calendar changing after each preflight = %d, want 201: %s", rr.Code, rr.Body.String())
+			}
+			if len(copies) != 1 {
+				t.Fatalf("guest holds %d calendars, want the copy", len(copies))
+			}
+			copied, err := repo.ListForCalendar(ctx, copies[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(copied) != 1 || copied[0].ResourceName != "late-1" || copied[0].ETag == "late-1" {
+				t.Fatalf("copy holds %+v, want late-1 under an ETag of its own", copied)
+			}
+		})
+	}
+}
+
+// A whole-collection COPY or MOVE takes the collection's own properties from
+// the row its transaction locks, which a PROPPATCH holding the collection
+// waits on, so a PROPPATCH that lands after the preflight is carried to the
+// destination rather than reverted.
+func TestPostgresCalendarCollectionTransferKeepsAPropertyPatchAfterThePreflight(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			db := newDAVPostgresStore(t)
+			ctx := t.Context()
+			owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Before"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := calendarCollectionResourcePath(source.ID)
+			seedWrittenMembers(t, db, owner, root, "seed", 3)
+			description, timezone, color := "Patched description", "Europe/Berlin", "#123456"
+			patched := store.CalendarProperties{Name: "Patched", Description: &description, Timezone: &timezone, Color: &color}
+			db.Events = &calendarListMutation{EventRepository: db.Events, calendarID: source.ID, mutate: func() error {
+				return db.PatchCalendarProperties(ctx, source.ID, patched, root, nil, nil, nil)
+			}}
+
+			slug := strings.ToLower(method) + "-target"
+			req := httptest.NewRequest(method, root+"/", nil)
+			req.Header.Set("Destination", "/dav/calendars/"+slug+"/")
+			rr := httptest.NewRecorder()
+			NewDavServer(Options{Store: db}).ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, owner)))
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("%s = %d, want 201: %s", method, rr.Code, rr.Body.String())
+			}
+			target := calendarWithSlug(t, db, owner.ID, slug)
+			if target == nil {
+				t.Fatalf("no calendar at %q after %s", slug, method)
+			}
+			if target.Name != patched.Name || target.Description == nil || *target.Description != description ||
+				target.Timezone == nil || *target.Timezone != timezone || target.Color == nil || *target.Color != color {
+				t.Errorf("%s target properties = %q %v %v %v, want the patched ones", method, target.Name, target.Description, target.Timezone, target.Color)
 			}
 		})
 	}

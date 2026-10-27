@@ -48,7 +48,7 @@ func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 	}
 	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve collection path")
 		return
 	}
 	name := strings.TrimSpace(parts[len(parts)-1])
@@ -95,7 +95,7 @@ func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "address book already exists", http.StatusConflict)
 			return
 		}
-		http.Error(w, "failed to create", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to create")
 		return
 	}
 	invalidateDAVRequestState(r.Context())
@@ -105,7 +105,7 @@ func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 			if deleteErr := h.store.AddressBooks.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
 				h.logger().Error("Mkcol", "failed to roll back address book %d after lock rebind failure: %v", created.ID, deleteErr)
 			}
-			http.Error(w, "failed to rebind collection locks", http.StatusInternalServerError)
+			writeServerFailure(w, err, "failed to rebind collection locks")
 			return
 		}
 		w.Header().Set("Location", location)
@@ -138,7 +138,7 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	pathName, locationStatus, err := h.mkcalendarLocation(r.Context(), user, cleanPath)
 	if err != nil {
 		h.logger().Error("Mkcalendar", "failed to check the calendar location %s: %v", cleanPath, err)
-		http.Error(w, "failed to check calendar location", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to check calendar location")
 		return
 	}
 	if locationStatus != 0 {
@@ -158,7 +158,7 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 
 	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 	if err != nil {
-		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to resolve collection path")
 		return
 	}
 
@@ -185,7 +185,7 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	slug := strings.ToLower(pathName)
 	exists, err := h.calendarCollectionExists(r.Context(), user, pathName, slug)
 	if err != nil {
-		http.Error(w, "failed to check calendars", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to check calendars")
 		return
 	}
 	if exists {
@@ -223,7 +223,7 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.logger().Error("Mkcalendar", "failed to create calendar collection at %s: %v", cleanPath, err)
-		http.Error(w, "failed to create", http.StatusInternalServerError)
+		writeServerFailure(w, err, "failed to create")
 		return
 	}
 	location := calendarStatePath(created.ID) + "/"

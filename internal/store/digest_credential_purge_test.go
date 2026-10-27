@@ -47,9 +47,12 @@ func (r *stubAppPasswordRepo) ListByUser(context.Context, int64) ([]AppPassword,
 	return nil, nil
 }
 func (r *stubAppPasswordRepo) GetByID(context.Context, int64) (*AppPassword, error) { return nil, nil }
-func (r *stubAppPasswordRepo) Revoke(context.Context, int64) error                  { return nil }
-func (r *stubAppPasswordRepo) DeleteRevoked(context.Context, int64) error           { return nil }
-func (r *stubAppPasswordRepo) TouchLastUsed(context.Context, int64) error           { return nil }
+func (r *stubAppPasswordRepo) StillValid(context.Context, int64, int64, string, string) (bool, error) {
+	return false, nil
+}
+func (r *stubAppPasswordRepo) Revoke(context.Context, int64) error        { return nil }
+func (r *stubAppPasswordRepo) DeleteRevoked(context.Context, int64) error { return nil }
+func (r *stubAppPasswordRepo) TouchLastUsed(context.Context, int64) error { return nil }
 func (r *stubAppPasswordRepo) ReplaceDigestCredentials(context.Context, int64, *string, *string, *string, *string) (bool, error) {
 	return false, nil
 }

@@ -120,15 +120,22 @@ func oauthCallbackPath(cfg *config.Config) string {
 	return cfg.OAuth.RedirectPath
 }
 
+// rateLimitMiddleware limits each client IP to rps requests per second with a
+// bucket of burst. A rate of 0 is a limiter turned off: the middleware passes
+// every request through.
+func rateLimitMiddleware(rps float64, burst int, trustedProxies []string) func(http.Handler) http.Handler {
+	if rps <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return ratelimit.NewIPRateLimiter(rate.Limit(rps), burst, 5*time.Minute, trustedProxies).Middleware()
+}
+
 // NewRouterWithOptions wires all HTTP routes and optional integrations.
 func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *auth.Service, opts RouterOptions) http.Handler {
 	r := chi.NewRouter()
 
-	// Auth endpoints: 5 requests per second, burst of 10
-	authRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(5), 10, 5*time.Minute, cfg.TrustedProxies)
-	// DAV endpoints: 20 requests per second, burst of 100 (more permissive for
-	// sync clients, which fan out many small PROPFIND/REPORT requests at once)
-	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 100, 5*time.Minute, cfg.TrustedProxies)
+	authRateLimit := rateLimitMiddleware(cfg.RateLimit.AuthRPS, cfg.RateLimit.AuthBurst, cfg.TrustedProxies)
+	davRateLimit := rateLimitMiddleware(cfg.RateLimit.DAVRPS, cfg.RateLimit.DAVBurst, cfg.TrustedProxies)
 
 	r.Use(middleware.RequestID)
 	r.Use(trustedRealIP(cfg.TrustedProxies))
@@ -142,6 +149,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		}))
 	}
 	r.Use(middleware.Recoverer)
+	r.Use(requestDeadline(cfg.HTTP.WriteTimeout))
 	r.Use(overrideMethod)
 	r.Use(metrics.Middleware())
 
@@ -150,11 +158,9 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	readiness := &readinessProbe{check: store.HealthCheck, timeout: readinessTimeout}
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-
-		if err := store.HealthCheck(ctx); err != nil {
+		if err := readiness.ready(r.Context()); err != nil {
 			http.Error(w, "unready", http.StatusServiceUnavailable)
 			return
 		}
@@ -197,12 +203,12 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	uiHandler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
 	apiHandler := api.NewHandler(cfg, store, dav.ValidateCalendarObject)
 	r.Route("/auth", func(r chi.Router) {
-		r.Use(authRateLimiter.Middleware())
+		r.Use(authRateLimit)
 		r.Get("/login", authService.BeginOAuth)
 	})
 	// Registered on the root rather than under /auth because the auth service
 	// sends the identity provider to BaseURL+RedirectPath, wherever that is.
-	r.With(authRateLimiter.Middleware()).Get(oauthCallbackPath(cfg), authService.HandleOAuthCallback)
+	r.With(authRateLimit).Get(oauthCallbackPath(cfg), authService.HandleOAuthCallback)
 
 	r.With(authService.RequireSession, csrf.Middleware(cfg)).Post("/auth/logout", uiHandler.Logout)
 
@@ -268,7 +274,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	})
 
 	r.Route("/api", func(r chi.Router) {
-		r.Use(davRateLimiter.Middleware())
+		r.Use(davRateLimit)
 		r.Use(authService.RequireDAVAuth)
 		r.Get("/calendars", apiHandler.ListCalendars)
 		r.Get("/calendars/{id}", apiHandler.GetCalendar)
@@ -305,7 +311,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	}
 
 	r.Route("/dav", func(r chi.Router) {
-		r.Use(davRateLimiter.Middleware())
+		r.Use(davRateLimit)
 
 		// OPTIONS and root PROPFIND must be accessible without authentication for CalDAV client discovery
 		r.Method("OPTIONS", "/*", davHandler)
@@ -382,6 +388,23 @@ func isBuiltInDAVMethod(method string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// requestDeadline ends each request's context once the server's write
+// timeout has passed. A response is undeliverable after that, so this cancels
+// only work that can no longer succeed, and it is what releases a handler
+// blocked on a database that has stopped answering.
+func requestDeadline(writeTimeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if writeTimeout <= 0 {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
 }
 

@@ -36,9 +36,10 @@ const transferMemberWork = 10_000
 // listings are, and the allowance of every member besides. A collection of
 // ordinary members therefore never runs the pool dry, whatever its size, and one
 // of hostile members costs the attempt that many allowances and one object's
-// worth more. Each attempt has a pool of its own, so a transfer the store sends
-// back for another attempt costs at most (1 + maxResourceStateRetries) times
-// that.
+// worth more. Each attempt validates on a pool of its own, and revalidates the
+// members that changed after it read them on another sized to those members
+// alone; a transfer the store sends back for another attempt makes at most
+// 1 + maxResourceStateRetries attempts.
 func transferWorkBudget(members int) int {
 	return ical.ObjectWorkBudget + members*transferMemberWork
 }

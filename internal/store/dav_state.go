@@ -119,6 +119,21 @@ func validateACLGuardTx(ctx context.Context, tx *sql.Tx, guard *ACLGuard) error 
 	return nil
 }
 
+// aclEntriesTx reads the ACL entries stored at resourcePaths inside tx, as
+// ListByResources reads them.
+func aclEntriesTx(ctx context.Context, tx *sql.Tx, resourcePaths []string) ([]ACLEntry, error) {
+	if len(resourcePaths) == 0 {
+		return nil, nil
+	}
+	const query = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY resource_path, ace_order, id`
+	rows, err := tx.QueryContext(ctx, query, pq.Array(resourcePaths))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanACLEntries(rows)
+}
+
 // validateACLGuardFallback is validateACLGuardTx for a store without a
 // connection pool, which has no transaction to hold the check in place.
 func validateACLGuardFallback(ctx context.Context, acl ACLRepository, guard *ACLGuard) error {

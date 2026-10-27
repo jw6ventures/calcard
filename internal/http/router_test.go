@@ -611,6 +611,68 @@ func TestRateLimiterBucketsByTheClientNotAForwardedHeader(t *testing.T) {
 	t.Fatal("rotating the leftmost X-Forwarded-For entry kept the client out of its own bucket for 50 requests")
 }
 
+// The auth and DAV limiters take their rate and burst from the configuration,
+// each with a bucket of its own. The refill rate is far too slow to matter
+// within the test, so each route admits exactly its burst.
+// A rate of 0 turns a limiter off: a fleet that limits at its load balancer
+// keeps CalCard's own buckets out of the way.
+func TestNewRouterTurnsOffALimiterWhoseRateIsZero(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	cfg := &config.Config{BaseURL: "http://localhost:8080"}
+	cfg.RateLimit.AuthRPS = 0
+	cfg.RateLimit.AuthBurst = 1
+	cfg.RateLimit.DAVRPS = 0
+	cfg.RateLimit.DAVBurst = 1
+	r := NewRouter(cfg, store.New(db), &auth.Service{})
+
+	for _, target := range []string{"/auth/callback?state=x&code=y", "/dav/"} {
+		for n := 0; n < 200; n++ {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+			if rec.Code == http.StatusTooManyRequests {
+				t.Fatalf("%s answered 429 on request %d although its rate is 0", target, n+1)
+			}
+		}
+	}
+}
+
+func TestNewRouterAppliesTheConfiguredRateLimits(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	cfg := &config.Config{BaseURL: "http://localhost:8080"}
+	cfg.RateLimit.AuthRPS = 0.001
+	cfg.RateLimit.AuthBurst = 2
+	cfg.RateLimit.DAVRPS = 0.001
+	cfg.RateLimit.DAVBurst = 3
+	r := NewRouter(cfg, store.New(db), &auth.Service{})
+
+	admitted := func(method, target string) int {
+		for n := 0; n < 10; n++ {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
+			if rec.Code == http.StatusTooManyRequests {
+				return n
+			}
+		}
+		return -1
+	}
+	if got := admitted(http.MethodGet, "/auth/callback?state=x&code=y"); got != 2 {
+		t.Errorf("auth endpoint admitted %d requests before 429, want the configured burst of 2", got)
+	}
+	if got := admitted(http.MethodOptions, "/dav/"); got != 3 {
+		t.Errorf("DAV endpoint admitted %d requests before 429, want the configured burst of 3", got)
+	}
+}
+
 // The auth service sends the identity provider to BaseURL+RedirectPath, so the
 // router has to serve the callback at that same path. A handler reached without
 // the state cookie answers 400 "invalid oauth state", which is what proves the

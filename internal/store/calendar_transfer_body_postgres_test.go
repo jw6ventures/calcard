@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -272,6 +273,86 @@ func TestPostgres_CalendarCollectionTransferStoresTransferredBodies(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+// A transfer that can revalidate its members proceeds from the members stored
+// once it holds the collection: it keeps each preflighted member still stored
+// as it was read, drops one deleted since, and hands every member rewritten or
+// added since to RevalidateMembers, whose answer it stores.
+func TestPostgres_CalendarCollectionTransferRevalidatesMembersChangedAfterPreflight(t *testing.T) {
+	for _, operation := range []CalendarCollectionTransferOperation{CalendarCollectionCopy, CalendarCollectionMove} {
+		for _, refused := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/refused=%t", operation, refused), func(t *testing.T) {
+				s := newPostgresStore(t)
+				ctx := context.Background()
+				fixture := newCollectionTransferFixture(t, s, "collection-revalidate-"+string(operation))
+				transfer := fixture.transfer(t, s, operation, fixture.members(operation))
+
+				rewritten := postgresCalendarObject("bom", "Rewritten")
+				late := postgresCalendarObject("late", "Late")
+				for _, write := range []CalendarObjectWrite{
+					{CalendarID: fixture.sourceID, UID: "bom", ResourceName: "bom", RawICAL: rewritten, ETag: "bom-rewritten"},
+					{CalendarID: fixture.sourceID, UID: "late", ResourceName: "late", RawICAL: late, ETag: "late-etag"},
+				} {
+					if _, err := s.PutCalendarObject(ctx, write); err != nil {
+						t.Fatalf("write %s: %v", write.UID, err)
+					}
+				}
+				if err := s.Events.DeleteByUID(ctx, fixture.sourceID, "plain"); err != nil {
+					t.Fatalf("delete plain: %v", err)
+				}
+
+				var given []string
+				errRefused := errors.New("refused")
+				transfer.RevalidateMembers = func(_ context.Context, changed []Event, _ []ACLEntry) ([]CalendarCollectionMember, error) {
+					members := make([]CalendarCollectionMember, 0, len(changed))
+					for _, event := range changed {
+						given = append(given, event.ResourceName+"@"+event.ETag)
+						member := CalendarCollectionMember{ID: event.ID, UID: event.UID, ResourceName: event.ResourceName,
+							RawICAL: event.RawICAL, ETag: event.ETag, Metadata: transferMetadata("Revalidated " + event.UID)}
+						if operation == CalendarCollectionCopy {
+							member.NewETag = event.UID + "-copy-etag"
+						}
+						members = append(members, member)
+					}
+					if refused {
+						return nil, errRefused
+					}
+					return members, nil
+				}
+
+				result, err := s.TransferCalendarCollection(ctx, transfer)
+				if want := []string{"bom@bom-rewritten", "late@late-etag"}; !slices.Equal(given, want) {
+					t.Errorf("RevalidateMembers given %v, want %v", given, want)
+				}
+				if refused {
+					if !errors.Is(err, errRefused) {
+						t.Fatalf("TransferCalendarCollection() error = %v, want the revalidation's", err)
+					}
+					calendars, err := s.Calendars.ListByUser(ctx, fixture.userID)
+					if err != nil || len(calendars) != 1 || calendars[0].ID != fixture.sourceID {
+						t.Fatalf("calendars after refused transfer = %#v, %v", calendars, err)
+					}
+					return
+				}
+				if err != nil || result == nil || result.Calendar == nil {
+					t.Fatalf("TransferCalendarCollection() = %#v, %v", result, err)
+				}
+				destinationID := result.Calendar.ID
+				etag := func(uid, stored string) string {
+					if operation == CalendarCollectionCopy {
+						return uid + "-copy-etag"
+					}
+					return stored
+				}
+				assertTransferredRow(t, loadStoredEventRow(t, s, destinationID, "bom"), rewritten, etag("bom", "bom-rewritten"), "Revalidated bom")
+				assertTransferredRow(t, loadStoredEventRow(t, s, destinationID, "late"), late, etag("late", "late-etag"), "Revalidated late")
+				if plain := loadStoredEventRow(t, s, destinationID, "plain"); plain != nil {
+					t.Errorf("transfer stored %q, deleted after the preflight", plain.ResourceName)
+				}
+			})
+		}
 	}
 }
 
