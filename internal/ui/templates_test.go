@@ -1071,3 +1071,17 @@ func TestRenderedPagesServeTheSharedSafeHTMLHelpers(t *testing.T) {
 		})
 	}
 }
+
+// A month grid day the user can add to shows its view and add buttons wherever
+// it is clicked, its date row included, even when the day has events.
+func TestMonthDayCellClick(t *testing.T) {
+	node := requireNode(t)
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command(node, filepath.Join("testdata", "day_cell_click.mjs"), filepath.Join("templates", name))
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+		})
+	}
+}

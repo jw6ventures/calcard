@@ -2171,7 +2171,9 @@
 
         var numEl = document.createElement('div');
         numEl.className = 'day-number';
-        if (dayEvents.length > 0) {
+        // A cell that can be selected shows the view and add buttons wherever
+        // it is clicked, so only a read-only cell opens the day's list here.
+        if (dayEvents.length > 0 && !(writableCalendars().length)) {
             numEl.className += ' has-events';
             numEl.addEventListener('click', function(e) {
                 e.stopPropagation();
