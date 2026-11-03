@@ -87,7 +87,7 @@ INSERT INTO users (oauth_subject, primary_email) VALUES ('existing', 'existing@e
 	if err := os.WriteFile(filepath.Join(migrations, "v1.3.0.sql"), contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	migrateWithRunner(t, pool, migrations, latestSchemaVersion)
+	migrateWithRunner(t, pool, migrations, "v1.3.0")
 
 	var weekStart int
 	if err := pool.QueryRow(`SELECT week_start FROM users WHERE oauth_subject = 'existing'`).Scan(&weekStart); err != nil {

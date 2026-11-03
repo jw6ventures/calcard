@@ -49,10 +49,6 @@ func applyV120Migration(t *testing.T, pool *sql.DB) {
 	}
 }
 
-// latestSchemaVersion is the version of the newest migration, which db.sql
-// also stamps: the schema the store's queries are written against.
-const latestSchemaVersion = "v1.3.0"
-
 // migrateWithRunner migrates pool the way the server does at startup:
 // MigrateDatabase applies, in version order and each in its own transaction,
 // the files in migrationsDir above the database's stamped version and up to

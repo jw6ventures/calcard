@@ -2329,10 +2329,15 @@ func expectDAVObjectIdentityLocks(mock sqlmock.Sqlmock, kind string, collectionI
 	}
 }
 
+// latestSchemaVersion is the version of the newest migration and the one
+// db.sql seeds: the schema the store's queries are written against. It is the
+// one place the tests name it, so a schema change bumps it here alone.
+const latestSchemaVersion = "v1.3.0"
+
 // baselineSchemaVersionRow is the version db.sql seeds, which every migration
 // test below asserts against: a fresh install and one upgraded through the
 // newest migration have to report the same schema version.
-const baselineSchemaVersionRow = "VALUES ('version', 'v1.3.0')"
+const baselineSchemaVersionRow = "VALUES ('version', '" + latestSchemaVersion + "')"
 
 // TestCalendarPropertyColumnsMigration pins that the migration and the flattened
 // baseline schema both add the columns the calendar live properties are read
