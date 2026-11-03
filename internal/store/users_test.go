@@ -31,7 +31,7 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
         full_name = EXCLUDED.full_name,
         first_name = EXCLUDED.first_name,
         last_login_at = NOW()
-RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start
 ), revoked AS (
     UPDATE app_passwords
     SET revoked_at = NOW()
@@ -43,12 +43,12 @@ RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, l
       )
     RETURNING id
 )
-SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start
 FROM upserted
 `)).
 		WithArgs("oauth-subject", "dana@example.com", "Dana Lee", "Dana").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at"}).
-			AddRow(int64(7), "oauth-subject", "dana@example.com", "Dana Lee", "Dana", now, now, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at", "week_start"}).
+			AddRow(int64(7), "oauth-subject", "dana@example.com", "Dana Lee", "Dana", now, now, nil, 0))
 
 	user, err := repo.UpsertOAuthUser(context.Background(), "oauth-subject", "dana@example.com", "Dana Lee", "Dana")
 	if err != nil {
@@ -73,8 +73,8 @@ func TestUserRepoUpsertOAuthUserRevokesAppPasswordsWhenEmailChanges(t *testing.T
 	now := time.Now().UTC()
 	mock.ExpectQuery(`(?s)WITH previous AS MATERIALIZED .*UPDATE app_passwords.*previous\.primary_email IS DISTINCT FROM \$2`).
 		WithArgs("oauth-subject", "new@example.com", "Dana Lee", "Dana").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at"}).
-			AddRow(int64(7), "oauth-subject", "new@example.com", "Dana Lee", "Dana", now, now, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at", "week_start"}).
+			AddRow(int64(7), "oauth-subject", "new@example.com", "Dana Lee", "Dana", now, now, nil, 0))
 
 	if _, err := repo.UpsertOAuthUser(context.Background(), "oauth-subject", "new@example.com", "Dana Lee", "Dana"); err != nil {
 		t.Fatalf("UpsertOAuthUser() error = %v", err)
@@ -95,8 +95,8 @@ func TestUserRepoUpsertOAuthUserClearsMissingProfileNames(t *testing.T) {
 	now := time.Now().UTC()
 	mock.ExpectQuery("INSERT INTO users").
 		WithArgs("oauth-subject", "updated@example.com", "", "").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at"}).
-			AddRow(int64(7), "oauth-subject", "updated@example.com", "", "", now, now, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at", "week_start"}).
+			AddRow(int64(7), "oauth-subject", "updated@example.com", "", "", now, now, nil, 0))
 
 	user, err := repo.UpsertOAuthUser(context.Background(), "oauth-subject", "updated@example.com", "", "")
 	if err != nil {

@@ -2332,7 +2332,7 @@ func expectDAVObjectIdentityLocks(mock sqlmock.Sqlmock, kind string, collectionI
 // baselineSchemaVersionRow is the version db.sql seeds, which every migration
 // test below asserts against: a fresh install and one upgraded through the
 // newest migration have to report the same schema version.
-const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0')"
+const baselineSchemaVersionRow = "VALUES ('version', 'v1.3.0')"
 
 // TestCalendarPropertyColumnsMigration pins that the migration and the flattened
 // baseline schema both add the columns the calendar live properties are read

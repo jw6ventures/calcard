@@ -102,6 +102,7 @@ func (f *fakeUserRepo) GetByID(_ context.Context, id int64) (*store.User, error)
 func (f *fakeUserRepo) GetByEmail(context.Context, string) (*store.User, error) { return nil, nil }
 func (f *fakeUserRepo) ListActive(context.Context) ([]store.User, error)        { return nil, nil }
 func (f *fakeUserRepo) MarkOnboardingComplete(context.Context, int64) error     { return nil }
+func (f *fakeUserRepo) SetWeekStart(context.Context, int64, time.Weekday) error { return nil }
 
 func newSharingHandler() (*Handler, *fakeACLRepo) {
 	acl := &fakeACLRepo{}

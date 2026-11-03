@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.2.0')
+VALUES ('version', 'v1.3.0')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -18,7 +18,10 @@ CREATE TABLE users (
     first_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    onboarding_completed_at TIMESTAMPTZ NULL
+    onboarding_completed_at TIMESTAMPTZ NULL,
+    -- The weekday calendar grids open on, as JavaScript's Date.getDay() and
+    -- Go's time.Weekday number it: 0 is Sunday.
+    week_start SMALLINT NOT NULL DEFAULT 0 CHECK (week_start BETWEEN 0 AND 6)
 );
 
 CREATE TABLE calendars (

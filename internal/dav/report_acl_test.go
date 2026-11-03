@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -51,6 +52,8 @@ func (r *aclReportUserRepo) ListActive(context.Context) ([]store.User, error) {
 }
 
 func (r *aclReportUserRepo) MarkOnboardingComplete(context.Context, int64) error { return nil }
+
+func (r *aclReportUserRepo) SetWeekStart(context.Context, int64, time.Weekday) error { return nil }
 
 func TestACLPrincipalPropSetReturnsEveryURLPrincipalOnce(t *testing.T) {
 	owner := store.User{ID: 1, PrimaryEmail: "owner@example.com", FullName: "Owner"}

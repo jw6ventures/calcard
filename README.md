@@ -9,6 +9,7 @@ CalCard makes it easy to self-host and share calendars, reminders, and contacts.
 * **Single sign-on (SSO)** - Sign into your existing identity service to access the website and manage your CalCard account.
 * **App passwords** - Generate passwords to connect devices to your account.
 * **Shared calendars** - Share calendars with other users.
+* **First day of the week** - Start the calendar grids on any day of the week from the Settings page.
 
 ## Prerequisites
 
