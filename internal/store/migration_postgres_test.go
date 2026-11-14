@@ -171,7 +171,7 @@ WHERE p.pronamespace = current_schema()::regnamespace`)
 func TestPostgres_UpgradeThroughRunnerMatchesFreshInstall(t *testing.T) {
 	const migrationsDir = "../../migrations"
 	fresh := newPostgresPool(t)
-	migrateWithRunner(t, fresh, migrationsDir, "v1.2.0")
+	migrateWithRunner(t, fresh, migrationsDir, latestSchemaVersion)
 	want := schemaCatalog(t, fresh)
 
 	for _, test := range []struct {
@@ -192,7 +192,7 @@ func TestPostgres_UpgradeThroughRunnerMatchesFreshInstall(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pool := test.install(t)
-			migrateWithRunner(t, pool, migrationsDir, "v1.2.0")
+			migrateWithRunner(t, pool, migrationsDir, latestSchemaVersion)
 
 			got := schemaCatalog(t, pool)
 			for definition := range want {
@@ -512,7 +512,7 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 		t.Fatalf("seed ACL: %v", err)
 	}
 
-	migrateWithRunner(t, pool, "../../migrations", "v1.2.0")
+	migrateWithRunner(t, pool, "../../migrations", latestSchemaVersion)
 
 	for _, uid := range []string{"rrule", "rdate", "detached"} {
 		var start, until *time.Time
@@ -584,6 +584,7 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 func TestPostgres_V120MigrationCreatesClaimableDigestNonceTable(t *testing.T) {
 	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
+	migrateWithRunner(t, pool, "../../migrations", latestSchemaVersion)
 
 	ctx := context.Background()
 	store := New(pool)

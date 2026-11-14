@@ -15,6 +15,8 @@ type User struct {
 	CreatedAt             time.Time
 	LastLoginAt           time.Time
 	OnboardingCompletedAt *time.Time
+	// WeekStart is the weekday the user's calendar grids open on.
+	WeekStart time.Weekday
 }
 
 // DisplayName returns the OAuth full name, falling back to the login email.
