@@ -131,8 +131,10 @@ jobs:
       # The DAV and store guarantees that are properties of one PostgreSQL
       # transaction only fail under real interleaving, which a single pass can
       # miss. -race is what makes that failure a report rather than a flake.
+      # internal/dav alone takes 7 to 10 minutes here under -race -count=2, so
+      # go test's default 10 minute per-package timeout kills it part way.
       - name: Test concurrency under the race detector
-        run: go test -race -count=2 ./internal/dav ./internal/store ./internal/auth
+        run: go test -race -count=2 -timeout 30m ./internal/dav ./internal/store ./internal/auth
 
       # The same cases run under "Test" above; this re-runs them verbosely so a
       # skip -- which is how they report a missing helm -- fails the job instead
