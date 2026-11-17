@@ -491,7 +491,7 @@ const DefaultOAuthRedirectPath = "/auth/callback"
 var ownedRoutePrefixes = []string{
 	"/auth", "/dav", "/api", "/healthz", "/readyz", "/metrics", "/.well-known",
 	"/principals", "/calendar", "/calendars", "/addressbooks", "/app-passwords",
-	"/sessions", "/birthdays", "/help", "/onboarding",
+	"/sessions", "/settings", "/birthdays", "/help", "/onboarding",
 }
 
 // ValidateOAuthRedirectPath reports whether path can be served as the OAuth

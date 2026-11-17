@@ -36,7 +36,7 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
         full_name = EXCLUDED.full_name,
         first_name = EXCLUDED.first_name,
         last_login_at = NOW()
-RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start
 ), revoked AS (
     UPDATE app_passwords
     SET revoked_at = NOW()
@@ -48,23 +48,23 @@ RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, l
       )
     RETURNING id
 )
-SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start
 FROM upserted
 `
 	defer observeDB(ctx, "users.upsert_oauth")()
 	row := r.pool.QueryRowContext(ctx, q, subject, email, fullName, firstName)
 	var u User
-	if err := row.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt, &u.WeekStart); err != nil {
 		return nil, err
 	}
 	return &u, nil
 }
 
 func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
-	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at FROM users WHERE id=$1`
+	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start FROM users WHERE id=$1`
 	defer observeDB(ctx, "users.get_by_id")()
 	var u User
-	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt); err != nil {
+	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt, &u.WeekStart); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -74,10 +74,10 @@ func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
 }
 
 func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) {
-	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at FROM users WHERE primary_email=$1`
+	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start FROM users WHERE primary_email=$1`
 	defer observeDB(ctx, "users.get_by_email")()
 	var u User
-	if err := r.pool.QueryRowContext(ctx, q, email).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt); err != nil {
+	if err := r.pool.QueryRowContext(ctx, q, email).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt, &u.WeekStart); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -87,7 +87,7 @@ func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) 
 }
 
 func (r *userRepo) ListActive(ctx context.Context) ([]User, error) {
-	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at FROM users WHERE last_login_at IS NOT NULL ORDER BY COALESCE(NULLIF(full_name, ''), primary_email), primary_email`
+	const q = `SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at, week_start FROM users WHERE last_login_at IS NOT NULL ORDER BY COALESCE(NULLIF(full_name, ''), primary_email), primary_email`
 	defer observeDB(ctx, "users.list_active")()
 	rows, err := r.pool.QueryContext(ctx, q)
 	if err != nil {
@@ -98,7 +98,7 @@ func (r *userRepo) ListActive(ctx context.Context) ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.FullName, &u.FirstName, &u.CreatedAt, &u.LastLoginAt, &u.OnboardingCompletedAt, &u.WeekStart); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -112,6 +112,17 @@ func (r *userRepo) MarkOnboardingComplete(ctx context.Context, userID int64) err
 	const q = `UPDATE users SET onboarding_completed_at = NOW() WHERE id=$1 AND onboarding_completed_at IS NULL`
 	defer observeDB(ctx, "users.mark_onboarding")()
 	_, err := r.pool.ExecContext(ctx, q, userID)
+	return err
+}
+
+// SetWeekStart records the weekday the user's calendar grids open on.
+func (r *userRepo) SetWeekStart(ctx context.Context, userID int64, weekStart time.Weekday) error {
+	if weekStart < time.Sunday || weekStart > time.Saturday {
+		return errors.New("week start is not a weekday")
+	}
+	const q = `UPDATE users SET week_start = $2 WHERE id=$1`
+	defer observeDB(ctx, "users.set_week_start")()
+	_, err := r.pool.ExecContext(ctx, q, userID, int(weekStart))
 	return err
 }
 

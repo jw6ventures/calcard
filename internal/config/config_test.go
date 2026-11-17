@@ -726,7 +726,7 @@ func TestLoadValidatesOAuthRedirectPath(t *testing.T) {
 		"/", "/auth", "/auth/login", "/auth/logout", "/auth/oidc",
 		"/dav", "/dav/cb", "/api/cb", "/healthz", "/readyz", "/metrics",
 		"/.well-known/caldav", "/.well-known/openid", "/principals/cb", "/calendar/cb",
-		"/calendars", "/calendars/cb", "/addressbooks", "/app-passwords", "/sessions",
+		"/calendars", "/calendars/cb", "/addressbooks", "/app-passwords", "/sessions", "/settings",
 		"/birthdays", "/help", "/onboarding/cb",
 	} {
 		t.Run("refuses "+value, func(t *testing.T) {

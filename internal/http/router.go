@@ -226,6 +226,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Get("/addressbooks/{id}", uiHandler.ViewAddressBook)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
 		r.Get("/sessions", uiHandler.Sessions)
+		r.Get("/settings", uiHandler.Settings)
 		r.Get("/birthdays", uiHandler.ViewBirthdays)
 		r.Get("/help", uiHandler.Help)
 
@@ -270,6 +271,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Post("/sessions/{id}/revoke", uiHandler.RevokeSession)
 		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)
 
+		r.Post("/settings", uiHandler.UpdateSettings)
 		r.Post("/onboarding/complete", uiHandler.CompleteOnboarding)
 	})
 

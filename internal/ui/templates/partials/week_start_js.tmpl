@@ -1,0 +1,16 @@
+{{define "week_start_js"}}
+// Lays calendar grids out from the user's first day of the week. weekStart is
+// numbered as Date.getDay() numbers days: 0 is Sunday.
+
+var WEEKDAY_SHORT_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// How many days date falls after the first day of its week.
+function daysIntoWeek(date, weekStart) {
+    return (date.getDay() - weekStart + 7) % 7;
+}
+
+// The short weekday names in column order, first day of the week first.
+function weekdayHeaders(weekStart) {
+    return WEEKDAY_SHORT_NAMES.slice(weekStart).concat(WEEKDAY_SHORT_NAMES.slice(0, weekStart));
+}
+{{end}}

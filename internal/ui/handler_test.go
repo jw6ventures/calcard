@@ -4414,7 +4414,8 @@ func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBook
 }
 
 type fakeUserRepo struct {
-	users map[int64]*store.User
+	users           map[int64]*store.User
+	setWeekStartErr error
 }
 
 type fakeAppPasswordRepo struct {
@@ -4503,6 +4504,16 @@ func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64)
 	if user, ok := f.users[userID]; ok {
 		now := time.Now()
 		user.OnboardingCompletedAt = &now
+	}
+	return nil
+}
+
+func (f *fakeUserRepo) SetWeekStart(ctx context.Context, userID int64, weekStart time.Weekday) error {
+	if f.setWeekStartErr != nil {
+		return f.setWeekStartErr
+	}
+	if user, ok := f.users[userID]; ok {
+		user.WeekStart = weekStart
 	}
 	return nil
 }

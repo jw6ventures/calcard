@@ -1,8 +1,11 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 
 const source = fs.readFileSync(process.argv[2], 'utf8');
+const weekStartHelpers = fs.readFileSync(path.join(path.dirname(process.argv[2]), 'partials', 'week_start_js.tmpl'), 'utf8')
+  .replace('{{define "week_start_js"}}', '').replace('{{end}}', '');
 function extract(name) {
   const start = source.indexOf('function ' + name + '(');
   assert.ok(start >= 0, `missing ${name}`);
@@ -33,12 +36,12 @@ for (const currentView of ['day', 'week']) {
     const elements = {};
     const start = new Date(startText);
     const context = {
-      Date, Math, currentView, currentDate:start, canCreate:false, CAL_COLOR:'#123456',
+      Date, Math, WEEK_START:0, currentView, currentDate:start, canCreate:false, CAL_COLOR:'#123456',
       baseEvents:[{dtstart:start,dtend:new Date(endText),summary:name}],
       expandRecurringEvents(events){return events}, isEventVisible(){return true}, writableCalendars(){return []},
       document:{getElementById(id){return elements[id] ||= element()}, createElement:element},
     };
-    vm.runInNewContext(['startOfDay','startOfWeek','addDays','eventIntersectsDay','renderTimeGridView'].map(extract).join('\n')+'\nrenderTimeGridView();', context);
+    vm.runInNewContext(weekStartHelpers+'\n'+['startOfDay','startOfWeek','addDays','eventIntersectsDay','renderTimeGridView'].map(extract).join('\n')+'\nrenderTimeGridView();', context);
     const event = elements['time-grid-body'].children.flatMap(el=>el.children).find(el=>el.className==='timed-event');
     assert.ok(event, `${currentView}: ${name} is missing`);
     assert.ok(Math.abs(parseFloat(event.style.top) - minute / 30 * 28) < 0.001, `${currentView}: ${name} top=${event.style.top}`);

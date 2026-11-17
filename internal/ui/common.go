@@ -84,6 +84,7 @@ var flashMessages = map[string]string{
 	"occurrence_deleted":   "Occurrence deleted.",
 	"sessions_revoked":     "All other sessions revoked.",
 	"session_revoked":      "Session revoked.",
+	"settings_saved":       "Settings saved.",
 }
 
 // flashMessage resolves a status key to its sentence. The import handlers build

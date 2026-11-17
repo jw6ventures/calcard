@@ -1085,3 +1085,22 @@ func TestMonthDayCellClick(t *testing.T) {
 		})
 	}
 }
+
+// Each calendar grid lays its month, and a calendar view its week, out from
+// whichever weekday the user picked as the first day of the week.
+func TestCalendarGridsStartOnUsersFirstDayOfWeek(t *testing.T) {
+	node := requireNode(t)
+	for _, view := range []struct{ template, render string }{
+		{"calendar_view.html", "renderMonthView"},
+		{"all_calendars_view.html", "renderMonthView"},
+		{"birthdays.html", "renderCalendar"},
+	} {
+		t.Run(view.template, func(t *testing.T) {
+			cmd := exec.Command(node, filepath.Join("testdata", "week_start_grid.mjs"),
+				filepath.Join("templates", view.template), view.render, filepath.Join("templates", "partials", "week_start_js.tmpl"))
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+		})
+	}
+}

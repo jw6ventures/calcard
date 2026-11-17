@@ -12,6 +12,7 @@ type UserRepository interface {
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	ListActive(ctx context.Context) ([]User, error)
 	MarkOnboardingComplete(ctx context.Context, userID int64) error
+	SetWeekStart(ctx context.Context, userID int64, weekStart time.Weekday) error
 }
 
 // CalendarRepository handles calendars lifecycle.

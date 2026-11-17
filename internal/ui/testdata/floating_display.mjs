@@ -64,11 +64,11 @@ for (const currentView of ['day', 'week']) {
   for (const [day, o] of byDay) {
     const elements = {};
     const grid = {
-      Date, Math, currentView, currentDate: new Date(2024, 2, day), canCreate: false, CAL_COLOR: '#123456',
+      Date, Math, WEEK_START: 0, currentView, currentDate: new Date(2024, 2, day), canCreate: false, CAL_COLOR: '#123456',
       baseEvents: [o], expandRecurringEvents(list) { return list; }, isEventVisible() { return true; }, writableCalendars() { return []; },
       document: {getElementById(id) { return elements[id] ||= element(); }, createElement: element},
     };
-    vm.runInNewContext(['startOfDay', 'startOfWeek', 'addDays', 'eventIntersectsDay', 'renderTimeGridView'].map(extract).join('\n') + '\nrenderTimeGridView();', grid);
+    vm.runInNewContext(['daysIntoWeek', 'startOfDay', 'startOfWeek', 'addDays', 'eventIntersectsDay', 'renderTimeGridView'].map(extract).join('\n') + '\nrenderTimeGridView();', grid);
     const placed = elements['time-grid-body'].children.flatMap((el) => el.children).find((el) => el.className === 'timed-event');
     assert.ok(placed, `${currentView}: the ${day}th is missing in ${zone}`);
     const minute = (day === 6 ? 11 : 9) * 60;

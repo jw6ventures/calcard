@@ -290,6 +290,10 @@
 {{template "safe_html_js"}}
 </script>
 <script>
+{{template "week_start_js"}}
+var WEEK_START = {{toJSON .User.WeekStart}};
+</script>
+<script>
 (function() {
     // Birthday data from server
     var birthdays = ({{toJSON .BirthdayEvents}} || []).map(function(raw) {
@@ -406,8 +410,7 @@
         grid.innerHTML = '';
         
         // Day headers
-        var days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        days.forEach(function(d) {
+        weekdayHeaders(WEEK_START).forEach(function(d) {
             var el = document.createElement('div');
             el.className = 'day-header';
             el.textContent = d;
@@ -417,12 +420,12 @@
         // Get first day of month and total days
         var firstDay = new Date(year, month, 1);
         var lastDay = new Date(year, month + 1, 0);
-        var startDayOfWeek = firstDay.getDay();
+        var leadingDays = daysIntoWeek(firstDay, WEEK_START);
         var totalDays = lastDay.getDate();
         
         // Previous month padding
         var prevMonthDays = new Date(year, month, 0).getDate();
-        for (var i = startDayOfWeek - 1; i >= 0; i--) {
+        for (var i = leadingDays - 1; i >= 0; i--) {
             createDayCell(grid, prevMonthDays - i, year, month - 1, true);
         }
         
@@ -434,7 +437,7 @@
         }
         
         // Next month padding
-        var totalCells = startDayOfWeek + totalDays;
+        var totalCells = leadingDays + totalDays;
         var remaining = (7 - (totalCells % 7)) % 7;
         for (var n = 1; n <= remaining; n++) {
             createDayCell(grid, n, year, month + 1, true);
